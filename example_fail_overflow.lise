@@ -1,0 +1,6 @@
+// EXPECTED TO FAIL: signed overflow is never silent in Lise.
+
+fn add(a: Integer, b: Integer) -> Integer
+is
+    return a + b
+end

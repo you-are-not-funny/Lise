@@ -1,0 +1,24 @@
+// A native program. `python lise.py run example_ok_main.lise`
+// The exit status is main's result: here, 6 = gcd(48, 18).
+
+fn gcd(a0: Integer where value >= 0, b0: Integer where value >= 0) -> Integer
+ensures result >= 0
+is
+    var a: Integer := a0
+    var b: Integer := b0
+    while b != 0
+    invariant a >= 0 and b >= 0
+    decreases b
+    do
+        let t = a % b
+        a := b
+        b := t
+    end
+    return a
+end
+
+fn main() -> Integer
+ensures result >= 0
+is
+    return gcd(48, 18)
+end

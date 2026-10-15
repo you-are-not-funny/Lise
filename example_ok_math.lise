@@ -1,0 +1,34 @@
+// Compiles to LLVM IR: `python lise.py build example_ok_math.lise`
+
+fn gcd(a0: Integer where value >= 0, b0: Integer where value >= 0) -> Integer
+ensures result >= 0
+is
+    var a: Integer := a0
+    var b: Integer := b0
+    while b != 0
+    invariant a >= 0 and b >= 0
+    decreases b
+    do
+        let t = a % b
+        a := b
+        b := t
+    end
+    return a
+end
+
+fn euclid_div(a: Integer where value > -1000 and value < 1000, b: Integer where value != 0 and value > -1000 and value < 1000) -> Integer
+ensures a == b * result + (a % b)
+is
+    return a / b
+end
+
+fn between(x: Integer, lo: Integer, hi: Integer) -> Bool
+ensures result == (lo <= x and x <= hi)
+is
+    return lo <= x and x <= hi
+end
+
+fn gcd_diff(a: Integer where value >= 0, b: Integer where value >= 0) -> Integer
+is
+    return gcd(a, b) - gcd(b, a)
+end

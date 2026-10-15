@@ -1,0 +1,19 @@
+// EXPECTED TO FAIL: push has no `requires queue.count < N`, so the buffer
+// can overflow. Lise rejects it and prints a counterexample.
+
+type PositiveSize = Integer where value > 0
+type ValidIndex[N: PositiveSize] = Integer where value >= 0 and value < N
+
+record RingBuffer[T, N: PositiveSize]
+    storage: Array[T, N]
+    head: ValidIndex[N]
+    tail: ValidIndex[N]
+    count: Integer where value >= 0 and value <= N
+end
+
+fn push[T, N: PositiveSize](item: consume T, queue: mutable RingBuffer[T, N])
+is
+    queue.storage[queue.tail] := item
+    queue.tail := (queue.tail + 1) % N
+    queue.count := queue.count + 1
+end

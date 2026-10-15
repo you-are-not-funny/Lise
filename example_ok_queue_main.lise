@@ -1,0 +1,50 @@
+// A native program with a generic verified ring buffer, instantiated for
+// Integer / capacity 4.   python lise.py run example_ok_queue_main.lise
+// Exit status = 42.
+
+type PositiveSize = Integer where value > 0
+type ValidIndex[N: PositiveSize] = Integer where value >= 0 and value < N
+
+record RingBuffer[T, N: PositiveSize]
+    storage: Array[T, N]
+    head: ValidIndex[N]
+    tail: ValidIndex[N]
+    count: Integer where value >= 0 and value <= N
+end
+
+enum QueueError
+    Full
+    Empty
+end
+
+fn push[T, N: PositiveSize](item: consume T, queue: mutable RingBuffer[T, N]) -> Outcome[Void, QueueError]
+requires queue.count < N
+ensures queue.count == old(queue.count) + 1
+ensures succeeded(result)
+is
+    queue.storage[queue.tail] := item
+    queue.tail := (queue.tail + 1) % N
+    queue.count := queue.count + 1
+    return Success(Void)
+end
+
+fn pop[N: PositiveSize](queue: mutable RingBuffer[Integer, N]) -> Integer
+requires queue.count > 0
+ensures queue.count == old(queue.count) - 1
+is
+    let x = queue.storage[queue.head]
+    queue.head := (queue.head + 1) % N
+    queue.count := queue.count - 1
+    return x
+end
+
+fn main() -> Integer
+is
+    var q: RingBuffer[Integer, 4] := RingBuffer(fill(0), 0, 0, 0)
+    let a = push[Integer, 4](10, q)
+    let b = push[Integer, 4](132, q)
+    assert succeeded(a) and succeeded(b)
+    let x = pop[4](q)
+    let y = pop[4](q)
+    return x % 100 + y % 100
+end

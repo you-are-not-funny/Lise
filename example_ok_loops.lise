@@ -1,0 +1,42 @@
+// Loops need an invariant and a `decreases` measure (termination is proven).
+
+fn sum_to(n: Integer where value >= 0 and value <= 1000) -> Integer
+ensures result >= 0
+ensures result <= 1000000
+is
+    var i: Integer := 0
+    var acc: Integer := 0
+    while i < n
+    invariant 0 <= i and i <= n
+    invariant 0 <= acc and acc <= i * 1000
+    decreases n - i
+    do
+        i := i + 1
+        acc := acc + i
+    end
+    return acc
+end
+
+fn clamp(x: Integer, lo: Integer, hi: Integer) -> Integer
+requires lo <= hi
+ensures result >= lo and result <= hi
+ensures (x >= lo and x <= hi) implies result == x
+is
+    if x < lo then
+        return lo
+    elif x > hi then
+        return hi
+    else
+        return x
+    end
+end
+
+fn safe_abs(x: Integer where value > -9223372036854775807) -> Integer
+ensures result >= 0
+ensures result == x or result == -x
+is
+    if x < 0 then
+        return -x
+    end
+    return x
+end

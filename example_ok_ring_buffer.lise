@@ -1,0 +1,53 @@
+// Lise example: a verified ring buffer.
+// Every array index, every integer operation and every contract below is
+// proven by the compiler (Z3). No proof => no binary.
+
+type PositiveSize = Integer where value > 0
+type ValidIndex[N: PositiveSize] = Integer where value >= 0 and value < N
+
+record RingBuffer[T, N: PositiveSize]
+    storage: Array[T, N]
+    head: ValidIndex[N]
+    tail: ValidIndex[N]
+    count: Integer where value >= 0 and value <= N
+end
+
+enum QueueError
+    Full
+    Empty
+end
+
+fn push[T, N: PositiveSize](item: consume T, queue: mutable RingBuffer[T, N]) -> Outcome[Void, QueueError]
+requires queue.count < N
+ensures queue.count == old(queue.count) + 1
+ensures queue.storage[old(queue.tail)] == item
+ensures succeeded(result)
+is
+    queue.storage[queue.tail] := item
+    queue.tail := (queue.tail + 1) % N
+    queue.count := queue.count + 1
+    return Success(Void)
+end
+
+// Comparing reads a value without moving it, so this is allowed on a borrowed T.
+fn front_equals[T, N: PositiveSize](queue: in RingBuffer[T, N], x: in T) -> Bool
+requires queue.count > 0
+ensures result == (queue.storage[queue.head] == x)
+is
+    return queue.storage[queue.head] == x
+end
+
+fn is_empty[T, N: PositiveSize](queue: in RingBuffer[T, N]) -> Bool
+ensures result == (queue.count == 0)
+is
+    return queue.count == 0
+end
+
+fn push_twice[T, N: PositiveSize](a: consume T, b: consume T, q: mutable RingBuffer[T, N])
+requires q.count + 2 <= N
+ensures q.count == old(q.count) + 2
+is
+    let first = push[T, N](a, q)
+    let second = push[T, N](b, q)
+    assert succeeded(first) and succeeded(second)
+end
