@@ -1,0 +1,23 @@
+// Output: print("literal") and print_int(n).  python lise.py run example_ok_hello.lise
+
+fn show(label: Integer where value >= 0, n: Integer)
+is
+    print("item ")
+    print_int(label)
+    print(" = ")
+    print_int(n)
+    print("\n")
+end
+
+fn main() -> Integer
+is
+    var i: Integer := 0
+    while i < 3
+    invariant 0 <= i and i <= 3
+    decreases 3 - i
+    do
+        show(i, i * i)
+        i := i + 1
+    end
+    return 0
+end

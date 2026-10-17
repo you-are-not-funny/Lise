@@ -10,11 +10,13 @@ usage:
   python lise.py run FILE [--timeout-ms N]
       build a native executable in a temp dir, run it, exit with its status
 
-safety options (build/run):
-  default            proofs are re-done from scratch (never trusts the cache) and the
-                     proven runtime checks are ALSO compiled in and trap on failure
-  --unchecked        erase the proven checks (zero cost; trusts the verifier fully)
+safety (build/run): there is one mode.  Proofs are always re-done from scratch (the
+  cache is never trusted for builds) and the proven obligations are kept as a trap backstop.
+  --independent      strict: also require EVERY proof to be re-derived by the solver-free checker
   --stack-limit N    reject if the static worst-case stack bound exceeds N bytes (default 1048576)
+  python lise.py interpret FILE
+      run main() under the executable reference semantics (SEMANTICS.md): no verification, no
+      compilation; every undefined behaviour is reported as STUCK with its location
   python lise.py version
 """
 import os
@@ -40,10 +42,28 @@ def collect(paths):
     return out
 
 
+def interpret_file(path):
+    from lise_semantics import Machine, Stuck
+    sys.setrecursionlimit(50000)
+    with open(path, encoding="utf-8") as fh:
+        prog = Parser(lex(fh.read())).parse_program()
+    m = Machine(prog)
+    try:
+        status, text = m.run_main()
+    except Stuck as ex:
+        sys.stdout.write("".join(m.out))
+        print(f"{path}:{ex.loc[0]}:{ex.loc[1]}: STUCK ({ex.kind}): {ex.msg}")
+        return 1
+    sys.stdout.write(text)
+    return status
+
+
 def main(argv):
     if len(argv) >= 2 and argv[1] == "version":
         print(f"lise {VERSION}")
         return 0
+    if len(argv) == 3 and argv[1] == "interpret":
+        return interpret_file(argv[2])
     if len(argv) < 3 or argv[1] not in ("check", "build", "run"):
         print(__doc__)
         return 2
@@ -51,7 +71,7 @@ def main(argv):
     build = cmd in ("build", "run")
     timeout, use_cache, paths, out_path = 10000, True, [], None
     exe, opt = cmd == "run", 2
-    checked, stack_limit = True, 1 << 20
+    stack_limit, strict = 1 << 20, False
     args = argv[2:]
     i = 0
     while i < len(args):
@@ -64,8 +84,8 @@ def main(argv):
         elif args[i] == "--no-cache":
             use_cache = False
             i += 1
-        elif args[i] == "--unchecked":
-            checked = False
+        elif args[i] == "--independent":
+            strict = True
             i += 1
         elif args[i] == "--stack-limit" and i + 1 < len(args):
             stack_limit = int(args[i + 1])
@@ -87,7 +107,7 @@ def main(argv):
         print("no .lise files given")
         return 2
     # Builds never trust the proof cache: a tampered cache must not produce a binary.
-    cache = ProofCache() if (use_cache and not build) else None
+    cache = ProofCache() if (use_cache and not build and not strict) else None   # strict never trusts a cache
     failed = 0
     run_status = None
     for f in files:
@@ -98,19 +118,20 @@ def main(argv):
             print(f"{f}: cannot read: {ex}")
             failed += 1
             continue
-        rep = check_source(src, f, timeout, cache)
+        rep = check_source(src, f, timeout, cache, strict)
         for d in rep.diags:
             print(d)
         if rep.ok:
             print(f"{f}: OK  ({rep.verified}/{rep.functions} functions proved, "
-                  f"{rep.cached} from cache, {rep.obligations} proof obligations)")
+                  f"{rep.cached} from cache, {rep.obligations} proof obligations, "
+                  f"{rep.confirmed} confirmed by cvc5, {rep.fm_confirmed} re-derived by the independent checker)")
         else:
             failed += 1
             print(f"{f}: FAILED ({len(rep.diags)} error(s))")
         if build and rep.ok:
             try:
                 ir = generate(Parser(lex(src)).parse_program(), os.path.basename(f),
-                              checked, stack_limit)
+                              stack_limit)
             except CodegenError as ex:
                 print(f"{f}:{ex.loc[0]}:{ex.loc[1]}: error: backend: {ex.msg}")
                 failed += 1

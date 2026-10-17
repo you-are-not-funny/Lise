@@ -17,6 +17,11 @@ class BoolLit:
     loc: Loc = (0, 0)
 
 @dataclass
+class Str:
+    value: str
+    loc: Loc = (0, 0)
+
+@dataclass
 class Name:
     ident: str
     loc: Loc = (0, 0)
@@ -174,6 +179,8 @@ class FnDecl:
     tok_lo: int = 0
     sig_hi: int = 0
     tok_hi: int = 0
+    decreases: Any = None            # termination measure (required for recursive functions)
+    dec_max: Optional[int] = None    # declared maximum of the measure: bounds the recursion depth
 
 @dataclass
 class Program:
@@ -194,6 +201,8 @@ def walk(n):
 def fmt_expr(e, top=True):
     if isinstance(e, Num):
         return str(e.value)
+    if isinstance(e, Str):
+        return '"' + e.value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\t", "\\t") + '"'
     if isinstance(e, BoolLit):
         return "true" if e.value else "false"
     if isinstance(e, Name):

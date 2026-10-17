@@ -10,6 +10,9 @@ import os
 
 import z3
 
+import lise_fmcheck
+import lise_xcheck
+
 from lise_ast import *
 from lise_ast import walk, fmt_expr, fmt_type
 from lise_lexer import LiseError, lex
@@ -19,7 +22,7 @@ VERSION = "0.2.0"
 I64_MIN = -(2 ** 63)
 I64_MAX = 2 ** 63 - 1
 BUILTIN_TYPES = {"Integer", "Bool", "Void", "Array", "Outcome"}
-BUILTIN_FNS = {"Success", "Failure", "succeeded", "failed", "fill"}
+BUILTIN_FNS = {"Success", "Failure", "succeeded", "failed", "fill", "print", "print_int"}
 RESERVED_VARS = {"value", "result"}
 _ENUM_SERIAL = {}
 
@@ -44,6 +47,8 @@ class Report:
         self.verified = 0
         self.cached = 0
         self.obligations = 0
+        self.confirmed = 0     # obligations re-confirmed by the second solver (cvc5)
+        self.fm_confirmed = 0  # ... and independently re-derived by the solver-free FM checker
 
     @property
     def ok(self):
@@ -146,6 +151,9 @@ class Verifier:
         self.types, self.records, self.fns = {}, {}, {}
         self.enums = {}      # name -> (sort, {variant: const})
         self.counters = {}
+        self._mods = {}
+        self.require_independent = False
+        self.agg_call_ok = False   # set only while a typed declaration evaluates its initialiser
         self.entry_consts = []
         self.tenv = {}
         void_sort = z3.DeclareSort("Void")
@@ -179,6 +187,33 @@ class Verifier:
         s.add(z3.Not(goal))
         r = s.check()
         ok = r == z3.unsat
+        if ok:
+            # Independent second opinion: both solvers must agree the negation is UNSAT.
+            status, detail = lise_xcheck.check(s, self.timeout * 2)
+            if status == lise_xcheck.UNSAT:
+                self.rep.confirmed += 1
+                fm_status, fm_detail = lise_fmcheck.check(s)
+                if fm_status == lise_fmcheck.UNSAT:
+                    self.rep.fm_confirmed += 1
+                elif self.require_independent:
+                    self.diag(loc, msg, ["strict mode (--independent): this proof was not re-derived by the "
+                                         f"independent checker ({fm_detail}); it needs nonlinear or array "
+                                         "reasoning outside the checker's fragment"])
+                    st.pc.append(goal)
+                    return False
+            elif status == lise_xcheck.SAT:
+                ok = False
+                self.diag(loc, msg, ["SOLVER DISAGREEMENT: Z3 proved this but cvc5 found a counterexample. "
+                                     "This is a solver or verifier bug; the proof is NOT accepted."])
+                st.pc.append(goal)
+                return False
+            else:
+                ok = False
+                self.diag(loc, msg, ["proved by Z3 but not confirmed by the second solver (cvc5: "
+                                     f"{detail or 'unknown/timeout'}); unconfirmed proofs are rejected. "
+                                     "Simplify the obligation (e.g. avoid heavy nonlinear arithmetic) or add intermediate assertions."])
+                st.pc.append(goal)
+                return False
         if not ok:
             notes = []
             if r == z3.sat:
@@ -206,7 +241,10 @@ class Verifier:
         s.set("timeout", 2000)
         for p in st.pc:
             s.add(p)
-        return s.check() != z3.unsat
+        if s.check() != z3.unsat:
+            return True
+        # Z3 says the path is dead: only prune it if cvc5 agrees (pruning skips obligations).
+        return lise_xcheck.check(s, 4000)[0] != lise_xcheck.UNSAT
 
     # ---------------- helpers on expressions
     def path_of(self, e):
@@ -489,6 +527,8 @@ class Verifier:
             return z3.IntVal(e.value)
         if isinstance(e, BoolLit):
             return z3.BoolVal(e.value)
+        if isinstance(e, Str):
+            raise LiseError('string literals can only be used as the argument of print("...")', e.loc)
         if isinstance(e, Name):
             if e.ident in st.env:
                 return st.env[e.ident]
@@ -589,6 +629,7 @@ class Verifier:
         raise LiseError(f"unknown operator '{op}'", e.loc)
 
     def ev_call(self, e, st, spec):
+        agg_ok, self.agg_call_ok = self.agg_call_ok, False
         name = e.name
         if name in ("Success", "Failure"):
             if e.targs is not None or len(e.args) != 1:
@@ -604,6 +645,20 @@ class Verifier:
             if not (v.sort() == self.outcome_sort):
                 raise LiseError(f"{name} expects an Outcome", e.args[0].loc)
             return self.outcome_sort.is_Success(v) if name == "succeeded" else self.outcome_sort.is_Failure(v)
+        if name in ("print", "print_int"):
+            if spec:
+                raise LiseError(f"'{name}' is not allowed inside contracts", e.loc)
+            if e.targs is not None or len(e.args) != 1:
+                raise LiseError(f"{name} takes exactly one argument", e.loc)
+            a = e.args[0]
+            if name == "print":
+                if not isinstance(a, Str):
+                    raise LiseError('print takes a string literal, e.g. print("hello\\n"); use print_int for Integers', a.loc)
+            else:
+                v = self.ev(a, st, spec)       # overflow etc. are proven as for any expression
+                if not (v.sort() == z3.IntSort()):
+                    raise LiseError("print_int takes an Integer", a.loc)
+            return self.void_val
         if name == "fill":
             if e.targs is not None or len(e.args) != 1:
                 raise LiseError("fill takes exactly one argument: fill(value)", e.loc)
@@ -619,9 +674,6 @@ class Verifier:
         callee = self.fns.get(name)
         if callee is None:
             raise LiseError(f"unknown function '{name}'", e.loc)
-        if name in self.recursive:
-            raise LiseError(f"'{name}' is (mutually) recursive; recursion is not supported yet "
-                            "(termination cannot be proven)", e.loc)
         has_mut = any(p.mode == "mutable" for p in callee.params)
         if has_mut and st.in_branch:
             raise LiseError("calls with 'mutable' arguments are not allowed inside the right side of "
@@ -702,22 +754,42 @@ class Verifier:
         for req in callee.requires:
             g = self.ev(req, cs, spec=True)
             self.prove(cs, g, f"precondition of '{name}' may not hold: {fmt_expr(req)}", e.loc)
-        # havoc mutable parameters
+        # termination: a call inside the caller's recursion cycle must strictly decrease the measure
+        if self.fn.name in self.recursive and name in self.scc.get(self.fn.name, ()):
+            mg = self.ev(callee.decreases, cs, spec=True)
+            self.prove(cs, mg >= 0, f"termination: the measure of '{name}' may be negative at this call", e.loc)
+            self.prove(cs, mg < self.entry_measure,
+                       f"termination: the measure of '{name}' ({fmt_expr(callee.decreases)}) may not be smaller "
+                       f"than this function's measure on entry ({fmt_expr(self.fn.decreases)})", e.loc)
+        # havoc the mutable parameters the callee may modify; the frame rule keeps the rest
         penv = dict(cenv)
+        mods = self.callee_mods(callee)
         for cpath, callerpath, lt in mapping:
+            if mods is not None and not any(cpath == q or cpath.startswith(q + ".") for q in mods):
+                continue            # callee cannot modify this leaf: value (and facts about it) survive
             f = self.fresh(callerpath, lt.sort)
             penv[cpath] = f
             st.env[callerpath] = f
             st.pc.extend(self.base_facts(lt, f))
         ret_rt = self.resolve_type(callee.ret, ctenv, None) if callee.ret else self.void_rt
-        if ret_rt.kind in ("record", "array"):
-            raise LiseError("functions returning records/arrays are not supported yet", callee.loc)
-        result = self.void_val if ret_rt.kind == "void" else self.fresh("call_" + name, ret_rt.sort)
-        st.pc.extend(self.base_facts(ret_rt, result))
         ps = State()
         ps.env = dict(penv)
-        ps.env["result"] = result
         ps.ltypes = cltypes
+        if ret_rt.kind in ("record", "array"):
+            if not agg_ok:
+                raise LiseError(f"'{name}' returns a {ret_rt.kind}: its result must initialise a typed "
+                                f"declaration, e.g. var x: {ret_rt.label} := {name}(...)", e.loc)
+            result = {}             # leaf path ("result", "result.f", ...) -> fresh value
+            for path, lt in self.leaves(ret_rt, "result"):
+                f = self.fresh("call_" + name + path[len("result"):], lt.sort)
+                st.pc.extend(self.base_facts(lt, f))
+                result[path] = (f, lt)
+                ps.env[path] = f
+                cltypes[path] = lt
+        else:
+            result = self.void_val if ret_rt.kind == "void" else self.fresh("call_" + name, ret_rt.sort)
+            st.pc.extend(self.base_facts(ret_rt, result))
+            ps.env["result"] = result
         ps.pc = st.pc
         ps.old_env = dict(cenv)
         ps.trust = True
@@ -725,7 +797,50 @@ class Verifier:
             st.pc.append(self.ev(ens, ps, spec=True))
         for p, crt in mut_rec:
             st.pc.extend(self.record_invs(crt, p, st.env, st.ltypes))
+        if isinstance(result, dict):
+            st.pc.extend(self.record_invs(ret_rt, "result", ps.env, cltypes))
+            return result, ret_rt
         return result
+
+    def callee_mods(self, callee):
+        """Frame rule: the parameter-relative paths `callee` may modify through its `mutable`
+        parameters (direct assignments, array element writes, and, transitively, through calls).
+        None means unknown (call cycle): treat everything as modified.  Everything else is
+        guaranteed unchanged by the call, so callers keep what they knew about it."""
+        if callee.name in self._mods:
+            return self._mods[callee.name]
+        self._mods[callee.name] = None            # cycle guard: assume everything
+        mp = {p.name for p in callee.params if p.mode == "mutable"}
+        mods = set()
+        for n in walk(callee.body):
+            if isinstance(n, Assign):
+                base = n.target.obj if isinstance(n.target, Index) else n.target
+                path = self.path_of(base)
+                if path is None:
+                    self._mods[callee.name] = None
+                    return None
+                if path.split(".")[0] in mp:
+                    mods.add(path)
+            elif isinstance(n, Call) and n.name in self.fns:
+                sub_fn = self.fns[n.name]
+                sub = self.callee_mods(sub_fn)
+                for prm, arg in zip(sub_fn.params, n.args):
+                    if prm.mode != "mutable":
+                        continue
+                    ap = self.path_of(arg)
+                    if ap is None:
+                        self._mods[callee.name] = None
+                        return None
+                    if ap.split(".")[0] not in mp:
+                        continue
+                    if sub is None:
+                        mods.add(ap)
+                    else:
+                        for q in sub:
+                            if q == prm.name or q.startswith(prm.name + "."):
+                                mods.add(ap + q[len(prm.name):])
+        self._mods[callee.name] = mods
+        return mods
 
     def record_type_at(self, st, path):
         parts = path.split(".")
@@ -797,6 +912,9 @@ class Verifier:
                 if self.ret_rt.kind != "void":
                     raise LiseError("this function must return a value", s.loc)
                 v = self.void_val
+            elif self.ret_rt.kind in ("record", "array"):
+                self.return_aggregate(s, st)
+                return []
             else:
                 v = self.ev(s.value, st)
                 self.check_sort(self.ret_rt, v, s.value, "in return")
@@ -828,6 +946,23 @@ class Verifier:
         """Local record/array declaration.  Arrays: `fill(x)`.  Records: `T(f1, f2, ...)`
         with one argument per field in declaration order (array fields take `fill(x)`)."""
         v = s.value
+        if isinstance(v, Call) and v.name in self.fns:
+            self.agg_call_ok = True
+            res = self.ev(v, st)
+            self.agg_call_ok = False
+            if not (isinstance(res, tuple) and isinstance(res[0], dict)):
+                raise LiseError(f"'{v.name}' does not return a record/array", v.loc)
+            leaves, crt = res
+            self.agg_compatible(st, crt, rt, f"result of '{v.name}'", v.loc)
+            if s.name in RESERVED_VARS:
+                raise LiseError(f"'{s.name}' is a reserved name", s.loc)
+            if s.name in st.vars or s.name in st.env or s.name in self.enums:
+                raise LiseError(f"'{s.name}' is already declared (shadowing is not allowed)", s.loc)
+            st.vars[s.name] = (rt, s.mutable)
+            for path, (f, lt) in leaves.items():
+                st.env[s.name + path[len("result"):]] = f
+                st.ltypes[s.name + path[len("result"):]] = lt
+            return [st]
         if rt.kind == "array":
             if not (isinstance(v, Call) and v.name == "fill"):
                 raise LiseError("an array local must be initialised with fill(value)", s.value.loc)
@@ -908,10 +1043,47 @@ class Verifier:
             st.moved.discard(root)  # re-initialisation of a moved variable
         return [st]
 
-    def do_return(self, st, v, loc):
+    def agg_compatible(self, st, a, b, what, loc):
+        """Prove that record/array type `a` is the same type as `b` (type args / lengths equal)."""
+        if a.kind != b.kind:
+            raise LiseError(f"{what} has type {a.label}, expected {b.label}", loc)
+        if a.kind == "record":
+            if a.decl is not b.decl:
+                raise LiseError(f"{what} is a {a.name}, expected {b.name}", loc)
+            for gname, (kind, bv) in b.tenv.items():
+                av = a.tenv[gname][1]
+                if kind == "type":
+                    if not (av.sort == bv.sort):
+                        raise LiseError(f"{what} has a different type argument '{gname}'", loc)
+                else:
+                    self.prove(st, av == bv, f"{what} may have a different '{gname}' than expected", loc)
+        else:
+            if not (a.elem.sort == b.elem.sort):
+                raise LiseError(f"{what} has a different element type", loc)
+            self.prove(st, a.length == b.length, f"{what} may have a different length than expected", loc)
+
+    def return_aggregate(self, s, st):
+        v = s.value
+        if not isinstance(v, Name) or v.ident not in st.vars:
+            raise LiseError("a function returning a record/array must `return` a local variable of that type", s.loc)
+        name = v.ident
+        if name in self.param_names and name not in self.consume_params:
+            raise LiseError(f"cannot return '{name}': it is a borrowed ('in'/'mutable') parameter; "
+                            "declare it 'consume' to hand its ownership back", v.loc)
+        if name in st.moved:
+            raise LiseError(f"use of moved value '{name}'", v.loc)
+        lrt = st.vars[name][0]
+        self.agg_compatible(st, lrt, self.ret_rt, f"returned value '{name}'", v.loc)
+        for g in self.record_invs(lrt, name, st.env, st.ltypes):
+            self.prove(st, g, f"invariant of '{lrt.label}' may not hold for '{name}' at return", s.loc)
+        self.move_out(v, st)
+        self.do_return(st, None, s.loc, agg=name)
+
+    def do_return(self, st, v, loc, agg=None):
         rt = self.ret_rt
-        for g in self.type_invs(rt, v):
-            self.prove(st, g, f"returned value may violate return type '{rt.label}'", loc)
+        if agg is None:
+            for g in self.type_invs(rt, v):
+                self.prove(st, g, f"returned value may violate return type '{rt.label}'", loc)
         for pname in self.param_names:
             prt = st.vars[pname][0]
             if pname in self.mut_params:
@@ -921,8 +1093,15 @@ class Verifier:
         es.env = {p: (st.old_env[p] if p.split(".")[0] in self.consume_params else st.env[p])
                   for p in self.param_paths}
         es.env.update(self.vals(self.tenv))
-        es.env["result"] = v
         es.ltypes, es.pc, es.old_env = st.ltypes, list(st.pc), st.old_env
+        if agg is None:
+            es.env["result"] = v
+        else:                       # `result.field` / `result[i]` in postconditions = the returned local's leaves
+            es.ltypes = dict(st.ltypes)
+            for path, lt in self.leaves(st.vars[agg][0], agg):
+                suffix = path[len(agg):]
+                es.env["result" + suffix] = st.env[path]
+                es.ltypes["result" + suffix] = lt
         for clause in self.fn.ensures:
             g = self.ev(clause, es, spec=True)
             self.expect_bool(g, clause)
@@ -1028,6 +1207,28 @@ class Verifier:
                     continue
                 seen2.add(m)
                 stack.extend(calls.get(m, ()))
+        # strongly connected component of every recursive function (mutual recursion)
+        self.scc = {}
+        for n in self.recursive:
+            self.scc[n] = {m for m in self.recursive if self.reaches(n, m) and self.reaches(m, n)} | {n}
+        for n in sorted(self.recursive):
+            f = self.fns[n]
+            if f.decreases is None:
+                raise LiseError(f"'{n}' is recursive: add a termination measure, e.g. "
+                                f"`decreases <integer expression> max <bound>` (the bound also limits the stack depth)",
+                                f.loc)
+
+    def reaches(self, a, b):
+        """True if function `a` can call function `b` (directly or transitively)."""
+        seen, stack = set(), list(self.calls.get(a, ()))
+        while stack:
+            m = stack.pop()
+            if m == b:
+                return True
+            if m not in seen:
+                seen.add(m)
+                stack.extend(self.calls.get(m, ()))
+        return False
 
     def tokhash(self, lo, hi):
         h = hashlib.sha256()
@@ -1044,13 +1245,15 @@ class Verifier:
 
     def fn_key(self, fn, dh):
         h = hashlib.sha256()
-        h.update(f"lise-{VERSION}|z3-{z3.get_version_string()}|".encode())
+        h.update(f"lise-{VERSION}|z3-{z3.get_version_string()}|cvc5-{lise_xcheck.version()}|".encode())
         h.update(self.tokhash(fn.tok_lo, fn.tok_hi))
         h.update(dh)
         for c in sorted(self.calls[fn.name]):  # callees: CONTRACT only (signature), not body
             callee = self.fns[c]
             h.update(c.encode())
             h.update(self.tokhash(callee.tok_lo, callee.sig_hi))
+            mods = self.callee_mods(callee)   # the frame rule makes callers depend on what callees modify
+            h.update(b"*" if mods is None else "|".join(sorted(mods)).encode())
         return h.hexdigest()
 
     def check_wellformed(self, rt, st, loc):
@@ -1131,14 +1334,22 @@ class Verifier:
             self.param_paths.extend(p for p, _ in self.leaves(rt, prm.name))
             st.pc.extend(self.record_invs(rt, prm.name, st.env, st.ltypes))
         self.ret_rt = self.resolve_type(fn.ret, self.tenv, st) if fn.ret else self.void_rt
-        if self.ret_rt.kind in ("record", "array"):
-            raise LiseError("functions returning records/arrays are not supported yet", fn.loc)
         st.old_env = None
         for r in fn.requires:
             g = self.ev(r, st, spec=True)
             self.expect_bool(g, r)
             st.pc.append(g)
         st.old_env = dict(st.env)
+        self.entry_measure = None
+        if fn.decreases is not None:
+            m = self.ev(fn.decreases, st, spec=True)
+            if not (m.sort() == z3.IntSort()):
+                raise LiseError("the decreases measure must be an Integer", fn.decreases.loc)
+            self.prove(st, m >= 0, f"the measure ({fmt_expr(fn.decreases)}) may be negative on entry", fn.decreases.loc)
+            self.prove(st, m <= fn.dec_max,
+                       f"the measure ({fmt_expr(fn.decreases)}) may exceed its declared maximum {fn.dec_max}",
+                       fn.decreases.loc)
+            self.entry_measure = m
         for e in self.exec_block(fn.body, st):
             if self.ret_rt.kind == "void":
                 self.do_return(e, self.void_val, fn.end_loc)
@@ -1179,7 +1390,7 @@ class Verifier:
                     self.cache.add(key)
 
 
-def check_source(src, filename="<input>", timeout_ms=10000, cache=None):
+def check_source(src, filename="<input>", timeout_ms=10000, cache=None, require_independent=False):
     rep = Report(filename)
     try:
         toks = lex(src)
@@ -1187,5 +1398,7 @@ def check_source(src, filename="<input>", timeout_ms=10000, cache=None):
     except LiseError as ex:
         rep.diags.append(Diag(filename, ex.loc, ex.msg))
         return rep
-    Verifier(prog, toks, filename, timeout_ms, cache, rep).run()
+    v = Verifier(prog, toks, filename, timeout_ms, cache, rep)
+    v.require_independent = require_independent
+    v.run()
     return rep

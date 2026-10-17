@@ -1,16 +1,15 @@
 """LLVM IR backend.  Runs ONLY after verification succeeds.
 
-Every overflow / bounds / division check is proven by the verifier.  Two modes:
-
-  checked   (DEFAULT) defence in depth: the proven checks are ALSO compiled in
-            (overflow-trapping arithmetic, bounds, division) and trap via
-            llvm.trap.  A verifier or backend bug then stops the program
-            instead of silently corrupting memory.
-  unchecked (--unchecked) proven checks are erased: zero runtime cost.
-
-Arithmetic never uses nsw/nuw, so even unchecked code cannot hit LLVM poison.
+Every overflow / bounds / division obligation is proven by the verifier before
+any code is generated.  There is exactly ONE kind of Lise program: there is no
+unchecked mode and no way to turn the safety rules off.  The proven obligations
+are additionally kept as a trap-on-violation backstop (llvm.trap).  In a
+correctly verified program a backstop never fires; if the verifier or backend
+ever has a bug, the program stops instead of corrupting memory.
+Arithmetic never uses nsw/nuw, so it cannot produce LLVM poison/UB.
 `/` and `%` are Euclidean.  A static worst-case stack bound is computed
-(no recursion, no heap) and the build fails if it exceeds the limit.
+(no heap; recursion only with a proven `decreases ... max B`, which bounds the depth) and the
+build fails if it exceeds the limit.
 
 Types (all erased of refinements):
   Integer -> i64     Bool -> i1     enum -> i32 (variant index)
@@ -22,8 +21,18 @@ Scalar `mutable` parameters are passed by pointer, everything else by value.
 Generics are monomorphized: every distinct instantiation (type args must be
 scalar types, value args are constants) becomes its own function/struct.
 
-Not yet: functions returning records/arrays, Outcome payloads, recursion,
-record-typed record fields as constructor arguments.
+Functions returning a record/array write it through a hidden first pointer
+parameter (the caller's fresh variable) with one memcpy at `return`.
+
+Recursion: every recursive function carries a proven termination measure `decreases m max B`
+(0 <= m <= B on entry, strictly smaller at each recursive call), so a recursion cycle is at most
+B+1 frames deep; the stack bound uses that.
+
+Not yet: Outcome payloads, record-typed record fields as constructor arguments.
+Output: print("literal") and print_int(n) call a tiny runtime written in LLVM IR
+(`lise_write`, `lise_print_int`) that uses only the POSIX write(2) call: no libc
+formatting, no buffers on the heap.  A failed write stops that output and the program
+continues; it can never corrupt memory.
 Contracts, asserts and `decreases` are erased.
 """
 import re
@@ -64,10 +73,74 @@ def mangle(s):
     return re.sub(r"[^A-Za-z0-9_]", "_", s)
 
 
+RUNTIME_WRITE = """declare i64 @write(i32, ptr, i64)
+
+define internal void @lise_write(ptr %p, i64 %n) {
+entry:
+  br label %loop
+loop:
+  %pp = phi ptr [ %p, %entry ], [ %pn, %cont ]
+  %nn = phi i64 [ %n, %entry ], [ %nrem, %cont ]
+  %done = icmp sle i64 %nn, 0
+  br i1 %done, label %exit, label %w
+w:
+  %r = call i64 @write(i32 1, ptr %pp, i64 %nn)
+  %bad = icmp sle i64 %r, 0
+  br i1 %bad, label %exit, label %cont
+cont:
+  %pn = getelementptr inbounds i8, ptr %pp, i64 %r
+  %nrem = sub i64 %nn, %r
+  br label %loop
+exit:
+  ret void
+}
+""".split("\n")
+
+# Decimal conversion on the unsigned magnitude (so INT64_MIN works); at most 19 digits plus '-'
+# fit in the 24-byte buffer, filled from the end.
+RUNTIME_PRINT_INT = """define internal void @lise_print_int(i64 %x) {
+entry:
+  %buf = alloca [24 x i8]
+  %neg = icmp slt i64 %x, 0
+  %nx = sub i64 0, %x
+  %u0 = select i1 %neg, i64 %nx, i64 %x
+  br label %loop
+loop:
+  %u = phi i64 [ %u0, %entry ], [ %q, %loop ]
+  %pos = phi i64 [ 24, %entry ], [ %pos1, %loop ]
+  %q = udiv i64 %u, 10
+  %r = urem i64 %u, 10
+  %d = trunc i64 %r to i8
+  %c = add i8 %d, 48
+  %pos1 = sub i64 %pos, 1
+  %g = getelementptr inbounds [24 x i8], ptr %buf, i64 0, i64 %pos1
+  store i8 %c, ptr %g
+  %more = icmp ne i64 %q, 0
+  br i1 %more, label %loop, label %sign
+sign:
+  br i1 %neg, label %minus, label %out
+minus:
+  %pm = sub i64 %pos1, 1
+  %gm = getelementptr inbounds [24 x i8], ptr %buf, i64 0, i64 %pm
+  store i8 45, ptr %gm
+  br label %out
+out:
+  %start = phi i64 [ %pos1, %sign ], [ %pm, %minus ]
+  %p = getelementptr inbounds [24 x i8], ptr %buf, i64 0, i64 %start
+  %len = sub i64 24, %start
+  call void @lise_write(ptr %p, i64 %len)
+  ret void
+}
+""".split("\n")
+
+
 class Codegen:
-    def __init__(self, prog, source_name="lise", checked=True, stack_limit=1 << 20):
-        self.checked, self.stack_limit = checked, stack_limit
+    def __init__(self, prog, source_name="lise", stack_limit=1 << 20):
+        self.stack_limit = stack_limit
         self.frames, self.edges, self.intr, self.names = {}, {}, set(), {}
+        self.need_memcpy = False
+        self.dec_max = {}
+        self.strings, self.uses_print, self.uses_print_int = [], False, False
         self.types = {d.name: d for d in prog.decls if isinstance(d, TypeDecl)}
         self.records = {d.name: d for d in prog.decls if isinstance(d, RecordDecl)}
         self.enums = {d.name: {v: i for i, v in enumerate(d.variants)}
@@ -209,31 +282,64 @@ class Codegen:
     FRAME_OVERHEAD = 256   # return address, saved registers, spill margin (conservative)
 
     def stack_bound(self):
-        memo, visiting = {}, set()
+        """Worst-case stack bytes per function.  Acyclic call chains add up frame sizes; a recursion
+        cycle (strongly connected component) is at most (B+1) frames deep, B = largest declared
+        `decreases ... max B` in the cycle, because its measure is a proven strictly decreasing
+        non-negative integer starting at most at B."""
+        index, low, on, stack, sccs, counter = {}, {}, set(), [], [], [0]
 
-        def depth(sym):
-            if sym in memo:
-                return memo[sym]
-            if sym in visiting:
-                raise CodegenError(f"call cycle through '{self.names[sym]}': recursion is not supported")
-            visiting.add(sym)
-            d = self.frames[sym] + self.FRAME_OVERHEAD + max((depth(c) for c in self.edges[sym]), default=0)
-            visiting.discard(sym)
-            memo[sym] = d
-            return d
+        def strong(v):
+            index[v] = low[v] = counter[0]
+            counter[0] += 1
+            stack.append(v)
+            on.add(v)
+            for w in self.edges[v]:
+                if w not in index:
+                    strong(w)
+                    low[v] = min(low[v], low[w])
+                elif w in on:
+                    low[v] = min(low[v], index[w])
+            if low[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                sccs.append(comp)
 
-        for sym in self.frames:
-            d = depth(sym)
-            if d > self.stack_limit:
-                raise CodegenError(f"worst-case stack use of '{self.names[sym]}' is about {d} bytes, over the "
-                                   f"limit of {self.stack_limit} bytes (raise it with --stack-limit)")
-        return memo
+        for v in sorted(self.frames):
+            if v not in index:
+                strong(v)
+        cost = {}
+        for comp in sccs:                      # callees' components come first
+            members = set(comp)
+            ext = max((cost[w] for m in comp for w in self.edges[m] if w not in members), default=0)
+            cyclic = len(comp) > 1 or comp[0] in self.edges[comp[0]]
+            if cyclic:
+                bounds = [self.dec_max.get(m) for m in comp]
+                if any(b is None for b in bounds):
+                    raise CodegenError(f"recursion through '{self.names[comp[0]]}' has no `decreases ... max` bound")
+                depth = max(bounds) + 1
+                total = depth * max(self.frames[m] + self.FRAME_OVERHEAD for m in comp) + ext
+            else:
+                total = self.frames[comp[0]] + self.FRAME_OVERHEAD + ext
+            for m in comp:
+                cost[m] = total
+                if total > self.stack_limit:
+                    raise CodegenError(f"worst-case stack use of '{self.names[m]}' is about {total} bytes, over the "
+                                       f"limit of {self.stack_limit} bytes (raise it with --stack-limit"
+                                       f"{', or lower the recursion bound' if cyclic else ''})")
+        return cost
 
     # ---------------------------------------------------------------- module
     def instance(self, fn, bindings):
         key = (fn.name, tuple(bindings))
         if key in self.insts:
             return self.insts[key]
+        if len(self.insts) >= 512:
+            raise CodegenError("more than 512 generic instantiations (infinitely recursive instantiation?)")
         if not fn.gparams:
             sym = f"lise_{fn.name}"
         else:
@@ -255,16 +361,32 @@ class Codegen:
             fn, bindings, sym = self.queue.pop(0)
             fn_lines.extend(self.emit_fn(fn, bindings, sym))
             fn_lines.append("")
+        if self.uses_print:
+            self.frames["lise_write"], self.edges["lise_write"], self.names["lise_write"] = 16, set(), "print"
+        if self.uses_print_int:
+            self.frames["lise_print_int"], self.names["lise_print_int"] = 32, "print_int"
+            self.edges["lise_print_int"] = {"lise_write"}
         self.stack_report = self.stack_bound()
         out = [f"; ModuleID = '{self.source_name}'", f'source_filename = "{self.source_name}"', ""]
         out.extend(self.type_defs)
         if self.type_defs:
             out.append("")
-        if self.checked:
-            out.append("declare void @llvm.trap() noreturn nounwind")
-            for name in sorted(self.intr):
-                out.append(f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)")
+        out.append("declare void @llvm.trap() noreturn nounwind")
+        for name in sorted(self.intr):
+            out.append(f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)")
+        out.append("")
+        if self.need_memcpy:
+            out.append("declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg)")
             out.append("")
+        for label, data in self.strings:
+            body = "".join(f"\\{b:02X}" for b in data)
+            out.append(f'{label} = private unnamed_addr constant [{len(data)} x i8] c"{body}"')
+        if self.strings:
+            out.append("")
+        if self.uses_print:
+            out.extend(RUNTIME_WRITE)
+        if self.uses_print_int:
+            out.extend(RUNTIME_PRINT_INT)
         out.extend(fn_lines)
         return "\n".join(out)
 
@@ -313,10 +435,10 @@ class Codegen:
         self.alloca_tys, self.trap_lbl, self.cur_edges = [], None, set()
         self.subst = self.as_subst(bindings)
         ret = self.resolve(fn.ret, self.subst) if fn.ret else VOID
-        if is_agg(ret):
-            raise CodegenError(f"'{fn.name}': returning records/arrays is not supported by the backend yet", fn.loc)
         self.ret_ty = ret
         sig, binds = [], []
+        if is_agg(ret):
+            sig.append("ptr %ret")          # destination supplied by the caller
         for p in fn.params:
             ty = self.resolve(p.ty, self.subst)
             if ty[0] == "void":
@@ -324,7 +446,7 @@ class Codegen:
             by_ptr = is_agg(ty) or p.mode == "mutable"
             sig.append(f"{'ptr' if by_ptr else self.lt(ty)} %arg.{p.name}")
             binds.append((p.name, ty, by_ptr))
-        head = f"define {self.lt(ret)} @{sym}({', '.join(sig)}) {{"
+        head = f"define {'void' if is_agg(ret) else self.lt(ret)} @{sym}({', '.join(sig)}) {{"
         self.body.append("entry:")
         for name, ty, by_ptr in binds:
             if by_ptr:
@@ -336,10 +458,8 @@ class Codegen:
         if not self.term:
             if ret == VOID:
                 self.o("ret void")
-            elif self.checked:
-                self.o(f"br label %{self.trap()}  ; proven unreachable; trap if the proof was wrong")
             else:
-                self.o("unreachable  ; proven unreachable by the verifier")
+                self.o(f"br label %{self.trap()}  ; proven unreachable; trap if the proof was wrong")
             self.term = True
         if self.trap_lbl:
             self.body.extend([f"{self.trap_lbl}:", "  call void @llvm.trap()", "  unreachable"])
@@ -350,6 +470,7 @@ class Codegen:
         self.frames[sym] = -(-frame // 16) * 16
         self.edges[sym] = self.cur_edges
         self.names[sym] = fn.name
+        self.dec_max[sym] = fn.dec_max
         return [head, self.body[0]] + self.allocas + self.body[1:] + ["}"]
 
     def block(self, stmts):
@@ -360,7 +481,7 @@ class Codegen:
             self.stmt(s)
         self.scopes.pop()
 
-    # ---------------------------------------------------------------- runtime checks (checked mode)
+    # ---------------------------------------------------------------- trap backstop for proven obligations
     def trap(self):
         if self.trap_lbl is None:
             self.trap_lbl = "trap"
@@ -374,12 +495,8 @@ class Codegen:
         self.start(ok)
 
     def arith(self, op, l, r):
-        """+ - * on i64: trapping on overflow when checked, plain wrapping otherwise."""
+        """+ - * on i64, trapping on overflow (proven impossible by the verifier)."""
         res = self.tmp()
-        if not self.checked:
-            ins = {"+": "add", "-": "sub", "*": "mul"}[op]
-            self.o(f"{res} = {ins} i64 {l}, {r}")
-            return res
         name = {"+": "sadd", "-": "ssub", "*": "smul"}[op]
         self.intr.add(name)
         pair, ov = self.tmp(), self.tmp()
@@ -417,6 +534,14 @@ class Codegen:
         elif isinstance(s, Return):
             if s.value is None:
                 self.o("ret void")
+            elif is_agg(self.ret_ty):
+                if not isinstance(s.value, Name):
+                    raise CodegenError("only a local variable can be returned as a record/array", s.loc)
+                src, t = self.lookup(s.value.ident, s.value.loc)
+                self.need_memcpy = True
+                size = f"ptrtoint (ptr getelementptr ({self.lt(t)}, ptr null, i32 1) to i64)"
+                self.o(f"call void @llvm.memcpy.p0.p0.i64(ptr %ret, ptr {src}, i64 {size}, i1 false)")
+                self.o("ret void")
             else:
                 v, t = self.expr(s.value)
                 self.o(f"ret {self.lt(t)} {v}")
@@ -452,6 +577,9 @@ class Codegen:
 
     # ---------------------------------------------------------------- aggregates
     def init_aggregate(self, ptr, ty, value):
+        if isinstance(value, Call) and value.name in self.fns:
+            self.call(value, dest=ptr)           # function returning a record/array: it fills `ptr`
+            return
         if ty[0] == "array":
             if not (isinstance(value, Call) and value.name == "fill" and len(value.args) == 1):
                 raise CodegenError("an array must be initialised with fill(value)", getattr(value, "loc", (0, 0)))
@@ -521,10 +649,9 @@ class Codegen:
             if t[0] != "array":
                 raise CodegenError(f"'{fmt_expr(e.obj)}' is not an array", e.loc)
             i, _ = self.expr(e.indices[0])
-            if self.checked:
-                bad = self.tmp()
-                self.o(f"{bad} = icmp uge i64 {i}, {t[2]}")
-                self.guard(bad)
+            bad = self.tmp()
+            self.o(f"{bad} = icmp uge i64 {i}, {t[2]}")
+            self.guard(bad)
             g = self.tmp()
             self.o(f"{g} = getelementptr inbounds {self.lt(t)}, ptr {p}, i64 0, i64 {i}")
             return g, t[1]
@@ -573,7 +700,7 @@ class Codegen:
         self.o(f"{r} = load {self.lt(t)}, ptr {ptr}")
         return r, t
 
-    def call(self, e):
+    def call(self, e, dest=None):
         if e.name in ("Success", "Failure"):
             if len(e.args) == 1 and isinstance(e.args[0], Call):
                 self.expr(e.args[0])
@@ -587,6 +714,22 @@ class Codegen:
             return r, BOOL
         if e.name == "fill":
             raise CodegenError("fill(...) is only allowed to initialise an array", e.loc)
+        if e.name == "print":
+            lit = e.args[0]
+            if not isinstance(lit, Str):
+                raise CodegenError("print takes a string literal", e.loc)
+            label = f"@.str.{len(self.strings)}"
+            self.strings.append((label, lit.value.encode("ascii")))
+            self.uses_print = True
+            self.cur_edges.add("lise_write")
+            self.o(f"call void @lise_write(ptr {label}, i64 {len(lit.value)})")
+            return "0", VOID
+        if e.name == "print_int":
+            v, _ = self.expr(e.args[0])
+            self.uses_print_int = self.uses_print = True
+            self.cur_edges.add("lise_print_int")
+            self.o(f"call void @lise_print_int(i64 {v})")
+            return "0", VOID
         fn = self.fns.get(e.name)
         if fn is None:
             raise CodegenError(f"call to unknown function '{e.name}'", e.loc)
@@ -609,6 +752,11 @@ class Codegen:
                 v, _ = self.expr(a)
                 args.append(f"{self.lt(pty)} {v}")
         rt = self.resolve(fn.ret, sub) if fn.ret else VOID
+        if is_agg(rt):
+            if dest is None:
+                raise CodegenError(f"'{e.name}' returns a {rt[0]}: use it to initialise a declaration", e.loc)
+            self.o(f"call void @{sym}({', '.join([f'ptr {dest}'] + args)})")
+            return "0", VOID
         if rt == VOID:
             self.o(f"call void @{sym}({', '.join(args)})")
             return "0", VOID
@@ -650,14 +798,13 @@ class Codegen:
             return res, BOOL
         if op in ("/", "%"):
             # Euclidean division; the verifier proved r != 0 and no overflow.
-            if self.checked:
-                z, a, b, c, bad = self.tmp(), self.tmp(), self.tmp(), self.tmp(), self.tmp()
-                self.o(f"{z} = icmp eq i64 {r}, 0")
-                self.o(f"{a} = icmp eq i64 {l}, -9223372036854775808")
-                self.o(f"{b} = icmp eq i64 {r}, -1")
-                self.o(f"{c} = and i1 {a}, {b}")
-                self.o(f"{bad} = or i1 {z}, {c}")
-                self.guard(bad)
+            z, a, b, c, bad = self.tmp(), self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.o(f"{z} = icmp eq i64 {r}, 0")
+            self.o(f"{a} = icmp eq i64 {l}, -9223372036854775808")
+            self.o(f"{b} = icmp eq i64 {r}, -1")
+            self.o(f"{c} = and i1 {a}, {b}")
+            self.o(f"{bad} = or i1 {z}, {c}")
+            self.guard(bad)
             rem, neg, bneg, babs = self.tmp(), self.tmp(), self.tmp(), self.tmp()
             self.o(f"{rem} = srem i64 {l}, {r}")
             self.o(f"{neg} = icmp slt i64 {rem}, 0")
@@ -680,5 +827,5 @@ class Codegen:
         raise CodegenError(f"operator '{op}' not supported by the backend", e.loc)
 
 
-def generate(prog, source_name="lise", checked=True, stack_limit=1 << 20):
-    return Codegen(prog, source_name, checked, stack_limit).emit_module()
+def generate(prog, source_name="lise", stack_limit=1 << 20):
+    return Codegen(prog, source_name, stack_limit).emit_module()

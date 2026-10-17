@@ -24,7 +24,7 @@ ONE_CHAR = set("+-*/%<>=()[],:.")
 
 @dataclass(frozen=True)
 class Token:
-    kind: str  # INT | IDENT | KW | OP | EOF
+    kind: str  # INT | STR | IDENT | KW | OP | EOF
     text: str
     line: int
     col: int
@@ -65,6 +65,29 @@ def lex(src):
                 raise LiseError("invalid number literal", (line, scol))
             toks.append(Token("INT", src[start:i], line, scol))
             col += i - start
+            continue
+        if c == '"':                      # string literal: printable ASCII only, escapes \n \t \\ \"
+            j, out = i + 1, []
+            while True:
+                if j >= n or src[j] == "\n":
+                    raise LiseError("unterminated string literal", (line, scol))
+                ch = src[j]
+                if ch == '"':
+                    break
+                if ch == "\\":
+                    j += 1
+                    esc = src[j] if j < n else ""
+                    if esc not in ("n", "t", "\\", '"'):
+                        raise LiseError(f"invalid escape sequence \\{esc} (allowed: \\n \\t \\\\ \\\")", (line, col + (j - i)))
+                    out.append({"n": "\n", "t": "\t", "\\": "\\", '"': '"'}[esc])
+                elif not (" " <= ch <= "~"):
+                    raise LiseError("string literals may only contain printable ASCII characters", (line, col + (j - i)))
+                else:
+                    out.append(ch)
+                j += 1
+            toks.append(Token("STR", "".join(out), line, scol))
+            col += j + 1 - i
+            i = j + 1
             continue
         two = src[i:i + 2]
         if two in TWO_CHAR:

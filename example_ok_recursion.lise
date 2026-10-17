@@ -1,0 +1,47 @@
+// Recursion needs a proven termination measure and a maximum for it:
+//   decreases <measure> max <bound>
+// The measure must be >= 0 and <= bound on entry and strictly smaller at every
+// recursive call, so the recursion is at most bound+1 frames deep and the
+// compiler can bound the stack.   python lise.py run example_ok_recursion.lise
+
+fn sum_to(n: Integer where value >= 0 and value <= 20) -> Integer
+decreases n max 20
+ensures result >= 0 and result <= 1000 * n
+is
+    if n == 0 then
+        return 0
+    end
+    let t = sum_to(n - 1)
+    return n + t
+end
+
+fn is_even(n: Integer where value >= 0 and value <= 50) -> Bool
+decreases n max 50
+ensures result == (n % 2 == 0)
+is
+    if n == 0 then
+        return true
+    end
+    return is_odd(n - 1)
+end
+
+fn is_odd(n: Integer where value >= 0 and value <= 50) -> Bool
+decreases n max 50
+ensures result == (n % 2 == 1)
+is
+    if n == 0 then
+        return false
+    end
+    return is_even(n - 1)
+end
+
+fn main() -> Integer
+is
+    print("sum_to(20) = ")
+    print_int(sum_to(20))
+    print("\n")
+    if is_even(40) and is_odd(37) then
+        print("parity ok\n")
+    end
+    return 0
+end

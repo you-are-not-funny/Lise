@@ -181,16 +181,31 @@ class Parser:
         if self.at_op("->"):
             self.next()
             ret = self.parse_type(allow_where=True)
-        reqs, enss = [], []
-        while self.at_kw("requires") or self.at_kw("ensures"):
-            kw = self.next().text
-            (reqs if kw == "requires" else enss).append(self.parse_expr())
+        reqs, enss, dec, dec_max = [], [], None, None
+        while self.at_kw("requires") or self.at_kw("ensures") or self.at_kw("decreases"):
+            kwtok = self.next()
+            if kwtok.text == "decreases":
+                if dec is not None:
+                    raise LiseError("a function can have only one 'decreases' clause", (kwtok.line, kwtok.col))
+                dec = self.parse_expr()
+                t = self.peek()
+                if not (t.kind == "IDENT" and t.text == "max"):
+                    raise LiseError("expected 'max <integer>' after the decreases measure (it bounds the "
+                                    "recursion depth), e.g. decreases n max 100", (t.line, t.col))
+                self.next()
+                t = self.peek()
+                if t.kind != "INT":
+                    raise LiseError("the maximum of a decreases measure must be an integer literal", (t.line, t.col))
+                dec_max = int(self.next().text)
+            else:
+                (reqs if kwtok.text == "requires" else enss).append(self.parse_expr())
         sig_hi = self.i
         self.expect_kw("is")
         body = self.parse_block()
         end_loc = self.loc()
         self.expect_kw("end")
         fn = FnDecl(name, gps, params, ret, reqs, enss, body, loc, end_loc)
+        fn.decreases, fn.dec_max = dec, dec_max
         fn.sig_hi = sig_hi
         return fn
 
@@ -378,6 +393,9 @@ class Parser:
         if t.kind == "INT":
             self.next()
             return Num(int(t.text), loc)
+        if t.kind == "STR":
+            self.next()
+            return Str(t.text, loc)
         if t.kind == "KW" and t.text in ("true", "false"):
             self.next()
             return BoolLit(t.text == "true", loc)
