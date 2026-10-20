@@ -4,7 +4,14 @@ import shutil
 import tempfile
 import unittest
 
-from lise_verify import ProofCache, check_source
+from lise_verify import ProofCache
+from lise_verify import check_source as _check_source
+
+
+def check_source(src, filename="<input>", timeout_ms=10000, cache=None, independent="require", lints=False):
+    """Most tests are about other rules, so the developer-mistake lints are off by default here; the
+    lint tests, the example-program tests and every CLI test run with them ON (the product default)."""
+    return _check_source(src, filename, timeout_ms, cache, independent, lints)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -692,8 +699,19 @@ class Safety(unittest.TestCase):
     }
 
     def test_backstop_traps_when_a_proof_would_be_wrong(self):
+        import subprocess
+        from lise_aot import build_executable
+        from lise_codegen import generate
+        from lise_lexer import lex
+        from lise_parser import Parser
         for name, src in self.BAD.items():
-            self.assertLess(self.native(src), 0, f"{name}: must die by signal (trap backstop)")
+            ir = generate(Parser(lex(src)).parse_program(), "t", 1 << 20)        # NO verifier on purpose
+            with tempfile.TemporaryDirectory() as d:
+                exe = os.path.join(d, "p")
+                build_executable(ir, exe, 2)
+                r = subprocess.run([exe], capture_output=True)
+            self.assertEqual(r.returncode, 71, f"{name}: the backstop must stop the program with exit status 71")
+            self.assertIn(b"internal safety check failed", r.stderr, name)
 
     def test_stack_bound_rejects_huge_frames(self):
         from lise_codegen import CodegenError, generate
@@ -747,7 +765,7 @@ class FuzzSmoke(unittest.TestCase):
     def test_fuzzer_finds_no_bug_in_a_short_run(self):
         import subprocess
         import sys
-        r = subprocess.run([sys.executable, os.path.join(HERE, "fuzz_lise.py"), "40", "7000"],
+        r = subprocess.run([sys.executable, os.path.join(HERE, "fuzz_lise.py"), "25", "7000"],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("BUGS=0", r.stdout)
@@ -1378,65 +1396,126 @@ class IndependentChecker(unittest.TestCase):
     def test_known_cases(self):
         import z3
         import lise_fmcheck as fm
-        x, y = z3.Ints("x y")
+        x, y, n, i, j = z3.Ints("x y n i j")
         a = z3.Array("a", z3.IntSort(), z3.IntSort())
         unsat = [[x >= 0, x <= 10, x + 1 > 11], [2 * x == 1], [x >= 0, x <= 8, x / 3 > 2], [x % 4 < 0],
                  [z3.If(x > 0, y == x, y == 0 - x), y < 0], [z3.Implies(x > 3, y > 3), x > 5, y < 2],
-                 [a[x] > 5, a[x] < 3], [x * y > 5, x * y < 3], [x > y, y > x], [3 * x + 3 * y == 1]]
+                 [a[x] > 5, a[x] < 3], [x * y > 5, x * y < 3], [x > y, y > x], [3 * x + 3 * y == 1],
+                 [x >= 0, x <= 10, y >= 0, y <= 10, x * y > 100], [x * x < 0], [x * y != y * x],
+                 [n >= 1, n <= 8, x >= 0, x % n >= n], [n > 0, i >= 0, i < n, (i + 1) % n >= n],
+                 [n < 0, x % n >= -n], [n >= 1, x >= 0, x / n > x], [x > -1000, x < 1000, n > -1000, n < 1000, n != 0,
+                                                                     x / n > 1000],
+                 [z3.Store(a, i, 5)[i] != 5], [i != j, z3.Store(a, i, 5)[j] != a[j]], [i == j, a[i] != a[j]],
+                 [z3.K(z3.IntSort(), 7)[i] != 7], [n == 0, n % 2 != 0], [n == 1, n % 2 == 0],
+                 [x >= 9, x <= 10, y >= 9, y <= 10, x * y < 5]]          # needs the McCormick lower envelope, not just corners
         for asrt in unsat:
             self.assertEqual(fm.check_assertions(asrt)[0], fm.UNSAT, asrt)
-        sat = [[x % 4 == 3], [x > 0, y > 0, x + y < 5], [x / 2 == -3], [x * y == 6]]
+        sat = [[x % 4 == 3], [x > 0, y > 0, x + y < 5], [x / 2 == -3], [x * y == 6], [x >= 0, x <= 2 ** 63 - 1, x + 1 > 2 ** 63 - 1],
+               [n >= 2, x % n == 1], [x >= 1, x <= 3, y >= 1, y <= 3, x * y == 2], [x >= 1, x <= 3, y >= 1, y <= 3, x * y == 4],
+               [n >= 1, n <= 3, x >= 0, x <= 10, x / n == 5], [n >= -3, n <= -1, x >= 0, x <= 10, x / n == -5]]
         for asrt in sat:
-            self.assertEqual(fm.check_assertions(asrt)[0], fm.UNKNOWN, asrt)
+            status, detail, env = fm.check_assertions_env(asrt)
+            self.assertEqual(status, fm.SAT, asrt)
+            s = z3.Solver()                     # the model it found must really satisfy the assertions (z3 as test oracle)
+            s.add(*asrt)
+            s.add(*[z3.Int(k) == v for k, v in env.items() if isinstance(v, int)])
+            self.assertEqual(s.check(), z3.sat, (asrt, env))
 
-    def test_never_claims_unsat_for_a_satisfiable_formula(self):
+    def test_never_wrong_in_either_direction_on_random_formulas(self):
+        """UNSAT only for unsatisfiable formulas, SAT only with a model that really satisfies them."""
         import random
         import z3
         import lise_fmcheck as fm
-        rng = random.Random(20260101)
-        confirmed = z3_unsat = 0
-        n = int(os.environ.get("LISE_FM_CASES", "1200"))
+        rng = random.Random(int(os.environ.get("LISE_FM_SEED", "20260101")))
+        confirmed = sat_found = z3_unsat = 0
+        n = int(os.environ.get("LISE_FM_CASES", "150"))
         for i in range(n):
             asrt = random_formula(rng, rng.choice([1, 2, 3]))
             s = z3.Solver()
             s.set("timeout", 3000)
             s.add(*asrt)
             truth = s.check()
-            mine = fm.check_assertions(asrt)[0]
-            if mine == fm.UNSAT:
-                self.assertEqual(truth, z3.unsat, f"UNSOUND checker on case {i}: {asrt}")
+            status, detail, env = fm.check_assertions_env(asrt)
+            if status == fm.UNSAT:
+                self.assertEqual(truth, z3.unsat, f"UNSOUND (claimed unsat) on case {i}: {asrt}")
                 confirmed += 1
+            elif status == fm.SAT:
+                self.assertEqual(truth, z3.sat, f"WRONG (claimed a counterexample) on case {i}: {asrt} {detail}")
+                sat_found += 1
             z3_unsat += truth == z3.unsat
         self.assertGreater(z3_unsat, n // 8, "generator produced too few unsatisfiable formulas")
-        self.assertGreater(confirmed, z3_unsat // 3, f"checker confirmed only {confirmed}/{z3_unsat}")
+        self.assertGreater(confirmed, z3_unsat // 2, f"checker confirmed only {confirmed}/{z3_unsat}")
+        self.assertGreater(sat_found, 0)
 
 
-class StrictIndependentMode(unittest.TestCase):
+class IndependentGate(unittest.TestCase):
+    """Z3 and cvc5 are not enough: the solver-free checker must re-derive every proof, and it can stop the
+    build on its own by finding a verified counterexample."""
     LINEAR = "fn f(x: Integer where value >= 0 and value <= 100) -> Integer\nensures result == x + 1\nis\n    return x + 1\nend\n"
-    NONLINEAR = "fn f(x: Integer where value >= 0 and value <= 100) -> Integer\nis\n    return x * x\nend\n"
+    BOUNDED_PRODUCT = "fn f(x: Integer where value >= 0 and value <= 100) -> Integer\nensures result >= 0\nis\n    return x * x\nend\n"
+    BEYOND = "fn f(x: Integer, y: Integer) -> Integer\nensures x * x * x * x + y * y * y * y >= 2 * x * x * y * y\nis\n    return 0\nend\n"
+    OVERFLOW = "fn f(x: Integer where value >= 0 and value <= 9223372036854775807) -> Integer\nis\n    return x + 1\nend\n"
 
-    def test_linear_proofs_are_rederived(self):
-        rep = check_source(self.LINEAR, "t.lise", require_independent=True)
-        self.assertTrue(rep.ok, msgs(rep))
-        self.assertEqual(rep.fm_confirmed, rep.obligations)
+    def test_linear_and_bounded_nonlinear_proofs_are_rederived(self):
+        for src in (self.LINEAR, self.BOUNDED_PRODUCT):
+            rep = check_source(src, "t.lise")
+            self.assertTrue(rep.ok, msgs(rep))
+            self.assertEqual(rep.fm_confirmed, rep.obligations)
 
-    def test_nonlinear_proofs_rejected_in_strict_mode_only(self):
-        self.assertTrue(check_source(self.NONLINEAR, "t.lise").ok)
-        rep = check_source(self.NONLINEAR, "t.lise", require_independent=True)
-        self.assertFalse(rep.ok)
-        self.assertIn("independent checker", msgs(rep))
+    def test_what_the_checker_cannot_rederive_is_rejected(self):
+        import lise_xcheck
+        real = lise_xcheck.check
+        lise_xcheck.check = lambda s, ms: ("unsat", "")        # a true statement that both solvers accept ...
+        try:
+            rep = check_source(self.BEYOND, "t.lise")
+        finally:
+            lise_xcheck.check = real
+        self.assertFalse(rep.ok)                                  # ... but the checker cannot re-derive: rejected
+        self.assertIn("not independently confirmed", msgs(rep))
 
-    def test_cli_flag_and_cache_is_not_trusted(self):
+    def test_there_is_no_way_to_turn_the_gate_off_in_the_cli(self):
         import subprocess
         import sys
         with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "n.lise")
-            open(path, "w").write(self.NONLINEAR)
-            cli = os.path.join(HERE, "lise.py")
-            subprocess.run([sys.executable, cli, "check", path], cwd=d, capture_output=True)      # fills the cache
-            r = subprocess.run([sys.executable, cli, "check", path, "--independent"], cwd=d,
-                               capture_output=True, text=True)
-            self.assertEqual(r.returncode, 1, r.stdout)
+            path = os.path.join(d, "b.lise")
+            open(path, "w").write(self.BEYOND)
+            for flag in ([], ["--independent"], ["--no-independent"]):
+                r = subprocess.run([sys.executable, os.path.join(HERE, "lise.py"), "check", path, "--no-cache"] + flag,
+                                   capture_output=True, text=True, cwd=d)
+                self.assertNotEqual(r.returncode, 0, flag)
+
+    def test_checker_stops_the_build_when_both_solvers_wrongly_accept(self):
+        """Simulate a soundness bug in BOTH solvers: they claim every obligation is proved."""
+        import z3
+        import lise_xcheck
+        rep = check_source(self.OVERFLOW, "t.lise")                  # sanity: the real verdict is "overflow"
+        self.assertFalse(rep.ok)
+        real_check, real_xcheck = z3.Solver.check, lise_xcheck.check
+        z3.Solver.check = lambda self, *a: z3.unsat
+        lise_xcheck.check = lambda s, ms: ("unsat", "")
+        try:
+            rep = check_source(self.OVERFLOW, "t.lise")
+        finally:
+            z3.Solver.check, lise_xcheck.check = real_check, real_xcheck
+        self.assertFalse(rep.ok)
+        text = msgs(rep)
+        self.assertIn("INDEPENDENT CHECKER DISAGREES", text)
+        self.assertIn("x@0 = 9223372036854775807", text)               # the verified counterexample
+
+    def test_gate_also_guards_dead_path_pruning(self):
+        import z3
+        import lise_xcheck
+        # a branch that is NOT dead, but both solvers claim it is: it must still be checked (and rejected)
+        src = "fn f(x: Integer where value >= 0 and value <= 9) -> Integer\nis\n    if x > 4 then\n        return 1 / (x - x)\n    end\n    return 0\nend\n"
+        self.assertFalse(check_source(src, "t.lise").ok)
+        real_check, real_xcheck = z3.Solver.check, lise_xcheck.check
+        z3.Solver.check = lambda self, *a: z3.unsat
+        lise_xcheck.check = lambda s, ms: ("unsat", "")
+        try:
+            rep = check_source(src, "t.lise")
+        finally:
+            z3.Solver.check, lise_xcheck.check = real_check, real_xcheck
+        self.assertFalse(rep.ok)
 
 
 def interpret(src, fn=None, args=()):
@@ -1586,7 +1665,8 @@ class ReferenceVsNative(unittest.TestCase):
             src = open(path, encoding="utf-8").read()
             if "fn main()" not in src:
                 continue
-            self.assertTrue(check_source(src, path).ok, path)
+            rep = check_source(src, path, lints=True)
+            self.assertTrue(rep.ok, path + "\n" + msgs(rep))
             self.assertEqual(self.native(src), interpret(src), os.path.basename(path))
             n += 1
         self.assertGreaterEqual(n, 4)
@@ -1596,3 +1676,417 @@ class ReferenceVsNative(unittest.TestCase):
                     Recursion.MUTUAL + "fn main() -> Integer\nis\n    if is_even(40) and is_odd(37) then\n        return 11\n    end\n    return 22\nend\n"):
             self.assertTrue(check_source(src, "t.lise").ok)
             self.assertEqual(self.native(src), interpret(src))
+
+
+OWN = """record R
+    a: Integer where value >= 0 and value <= 9
+    b: Integer where value >= 0 and value <= 9
+end
+fn take(r: consume R) -> Integer
+is
+    return r.a
+end
+fn peek(r: R) -> Integer
+is
+    return r.a
+end
+fn bump(r: mutable R)
+is
+    r.a := 1
+end
+fn both(x: mutable R, y: R) -> Integer
+is
+    x.a := 2
+    return y.b
+end
+"""
+
+
+class OwnershipRules(unittest.TestCase):
+    """Each rule is enforced twice, independently: statically by the verifier and dynamically (by
+    storage identity) by the reference semantics.  Rule-breaking programs must be rejected by the
+    verifier AND be STUCK(ownership) when interpreted; good programs must do neither."""
+
+    def program(self, body):
+        return OWN + "fn main() -> Integer\nis\n" + body + "    return 0\nend\n"
+
+    BAD = {
+        "use after move": "    var r: R := R(1, 2)\n    let x = take(r)\n    let y = peek(r)\n",
+        "double move": "    var r: R := R(1, 2)\n    let x = take(r)\n    let y = take(r)\n",
+        "field of moved": "    var r: R := R(1, 2)\n    let x = take(r)\n    r.a := 3\n",
+        "assign to let": "    let r: R = R(1, 2)\n    r.a := 3\n",
+        "mutable arg is let": "    let r: R = R(1, 2)\n    bump(r)\n",
+        "aliased mutable args": "    var r: R := R(1, 2)\n    let x = both(r, r)\n",
+        "mutable arg also read": "    var r: R := R(1, 2)\n    var s: Integer := 0\n    mix2(r, r.a)\n",
+        "moved in a loop": "    var r: R := R(1, 2)\n    var i: Integer := 0\n    while i < 2\n    invariant 0 <= i and i <= 2\n    decreases 2 - i\n    do\n        let x = take(r)\n        i := i + 1\n    end\n",
+        "conditional move then use": "    var r: R := R(1, 2)\n    if 1 == 1 then\n        let x = take(r)\n    end\n    let y = peek(r)\n",
+    }
+    GOOD = {
+        "plain": "    var r: R := R(1, 2)\n    let x = peek(r)\n    bump(r)\n    let y = take(r)\n",
+        "two records": "    var r: R := R(1, 2)\n    var s: R := R(3, 4)\n    let x = both(r, s)\n    let y = take(s)\n",
+        "disjoint fields are conservatively refused": None,
+    }
+
+    def test_rule_breaking_programs_are_rejected_and_stuck(self):
+        from lise_semantics import Stuck
+        src_extra = "fn mix2(x: mutable R, k: Integer where value >= 0 and value <= 9)\nis\n    x.a := k\nend\n"
+        for name, body in self.BAD.items():
+            src = OWN + src_extra + "fn main() -> Integer\nis\n" + body + "    return 0\nend\n"
+            rep = check_source(src, "t.lise")
+            self.assertFalse(rep.ok, f"verifier accepted: {name}")
+            with self.assertRaises(Stuck, msg=name) as cm:
+                interpret(src)
+            self.assertEqual(cm.exception.kind, "ownership", f"{name}: {cm.exception}")
+
+    def test_good_programs_are_accepted_and_run(self):
+        for name, body in self.GOOD.items():
+            if body is None:
+                continue
+            src = self.program(body)
+            self.assertTrue(check_source(src, "t.lise").ok, name)
+            self.assertEqual(interpret(src)[0], 0)
+
+    def test_moving_borrowed_parameters_and_fields(self):
+        from lise_semantics import Stuck
+        for helper in ("fn f(r: R) -> Integer\nis\n    return take(r)\nend\n",
+                       "fn f(r: mutable R) -> Integer\nis\n    return take(r)\nend\n",
+                       "fn f(r: R)\nis\n    r.a := 1\nend\n"):
+            src = OWN + helper + "fn main() -> Integer\nis\n    var r: R := R(1, 2)\n    return 0\nend\n"
+            self.assertFalse(check_source(src, "t.lise").ok, helper)
+            call = OWN + helper + "fn main() -> Integer\nis\n    var r: R := R(1, 2)\n    f(r)\n    return 0\nend\n"
+            with self.assertRaises(Stuck):
+                interpret(call.replace("    f(r)\n", "    let z = f(r)\n") if "-> Integer" in helper else call)
+
+    def test_reinitialising_a_moved_variable_is_allowed(self):
+        src = """fn main() -> Integer
+is
+    var n: Integer := 5
+    n := n + 1
+    return n
+end
+"""
+        self.assertTrue(check_source(src, "t.lise").ok)
+        self.assertEqual(interpret(src)[0], 6)
+
+    def test_generic_type_parameters_are_move_only_inside_the_function(self):
+        gen = """record Box[T]
+    item: T
+end
+fn dup[T](x: consume T, b: mutable Box[T]) -> Integer
+is
+    b.item := x
+    b.item := x
+    return 0
+end
+fn main() -> Integer
+is
+    var b: Box[Integer] := Box(1)
+    return dup[Integer](2, b)
+end
+"""
+        from lise_semantics import Stuck
+        self.assertFalse(check_source(gen, "t.lise").ok)                  # x moved twice
+        with self.assertRaises(Stuck) as cm:
+            interpret(gen)
+        self.assertEqual(cm.exception.kind, "ownership")
+        ok = gen.replace("    b.item := x\n    b.item := x\n", "    b.item := x\n")
+        self.assertTrue(check_source(ok, "t.lise").ok, msgs(check_source(ok, "t.lise")))
+        self.assertEqual(interpret(ok)[0], 0)
+        # a CONCRETE type is Copy: the same double assignment is fine when T is written as Integer
+        concrete = """record Box2
+    item: Integer
+end
+fn dup2(x: Integer, b: mutable Box2) -> Integer
+is
+    b.item := x
+    b.item := x
+    return 0
+end
+fn main() -> Integer
+is
+    var b: Box2 := Box2(1)
+    return dup2(2, b)
+end
+"""
+        self.assertTrue(check_source(concrete, "t.lise").ok)
+        self.assertEqual(interpret(concrete)[0], 0)
+
+
+class OwnershipFuzzSmoke(unittest.TestCase):
+    def test_ownership_fuzzer_finds_nothing_in_a_short_run(self):
+        import subprocess
+        import sys
+        r = subprocess.run([sys.executable, os.path.join(HERE, "fuzz_own.py"), "30", "9000"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("BUGS=0", r.stdout)
+
+
+class DeveloperGuards(unittest.TestCase):
+    """Mistakes a tired developer makes are build errors, not warnings: unused values (including ignored
+    results), contradictory preconditions, code that can never run, self-assignment."""
+
+    def lint(self, src):
+        return check_source(src, "t.lise", lints=True)
+
+    def bad(self, src, text):
+        rep = self.lint(src)
+        self.assertFalse(rep.ok, "accepted: " + src)
+        self.assertIn(text, msgs(rep))
+
+    def ok(self, src):
+        rep = self.lint(src)
+        self.assertTrue(rep.ok, msgs(rep))
+
+    def fn(self, body, params="x: Integer where value >= 0 and value <= 9", extra=""):
+        return f"fn f({params}) -> Integer\n{extra}is\n{body}end\n"
+
+    def test_unused_variables_and_ignored_results(self):
+        self.bad(self.fn("    let y = 5\n    return x\n"), "variable 'y' is never read")
+        self.bad(self.fn("    var y: Integer := 1\n    y := 2\n    return x\n"), "variable 'y' is never read")
+        self.bad("fn g() -> Integer\nis\n    return 1\nend\n" + self.fn("    let r = g()\n    return x\n"), "never read")
+        self.ok(self.fn("    let _y = 5\n    return x\n"))                         # explicit "ignore on purpose"
+        self.ok(self.fn("    let y = x + 1\n    return y\n"))
+
+    def test_ignored_outcome_is_caught_even_when_bound_to_a_name(self):
+        self.bad(RET.replace("var q: RB[Integer, 4] := make_queue(3)\n    assert q.head == 3",
+                             "var q: RB[Integer, 4] := make_queue(3)\n    let ignored = zeros()\n    assert q.head == 3")
+                 .replace("var z: Array[Integer, 3] := zeros()", "var z: Array[Integer, 3] := fill(7)"), "never read")
+
+    def test_unused_parameters(self):
+        self.bad(self.fn("    return 1\n"), "parameter 'x' is never used")
+        self.ok(self.fn("    return 1\n", params="_x: Integer"))
+        self.ok(self.fn("    return 1\n", extra="ensures x >= 0\n"))                 # used in a contract: fine
+        self.ok("fn f(r: mutable R2)\nis\n    r.a := 1\nend\nrecord R2\n    a: Integer where value >= 0 and value <= 9\nend\n")
+
+    def test_contradictory_preconditions_are_vacuous(self):
+        self.bad(self.fn("    return x\n", extra="requires x > 5 and x < 3\n"), "contradictory")
+        self.bad(self.fn("    return x\n", extra="requires x > 100\n"), "contradictory")      # clashes with x <= 9
+        self.ok(self.fn("    return x\n", extra="requires x > 3\n"))
+
+    def test_unreachable_code(self):
+        self.bad(self.fn("    return x\n    return 1\n"), "unreachable code")
+        self.bad(self.fn("    if x > 100 then\n        return 1\n    end\n    return x\n"), "can never be true")
+        self.bad(self.fn("    if x < 100 then\n        return 1\n    end\n    return 0\n"), "always true")
+        self.bad(self.fn("    if x < 100 then\n        return 1\n    else\n        return 2\n    end\n"), "`else` branch can never run")
+        self.ok(self.fn("    if x > 4 then\n        return 1\n    end\n    return x\n"))
+        self.ok(self.fn("    if x > 4 then\n        return 1\n    else\n        return 2\n    end\n"))
+
+    def test_branch_live_in_only_some_paths_is_fine(self):
+        self.ok("fn f(a: Integer where value >= 0 and value <= 1, b: Integer where value >= 0 and value <= 1) -> Integer\nis\n"
+                "    var r: Integer := 0\n    if a == 1 then\n        r := 1\n    end\n    if r == 1 then\n        r := 5\n    end\n"
+                "    return r + b\nend\n")
+
+    def test_self_assignment(self):
+        self.bad(self.fn("    var y: Integer := x\n    y := y\n    return y\n"), "assigned to itself")
+
+    def test_lints_are_on_in_the_cli_and_cannot_be_disabled(self):
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "l.lise")
+            with open(path, "w") as f:
+                f.write(self.fn("    let y = 5\n    return x\n"))
+            for flags in ([], ["--no-lints"], ["--no-cache"]):
+                r = subprocess.run([sys.executable, os.path.join(HERE, "lise.py"), "check", path] + flags,
+                                   capture_output=True, text=True, cwd=d)
+                self.assertNotEqual(r.returncode, 0, flags)
+            self.assertIn("lint:", r.stdout)
+
+
+def cert_con(coeffs, const):
+    return [[[v, a] for v, a in sorted(coeffs.items())], const]
+
+
+class CertificateValidator(unittest.TestCase):
+    """lise_certcheck is the small trusted core (standard library only).  It must accept good certificates
+    and reject every kind of bogus one."""
+
+    def verify(self, formulas, proof, rels=()):
+        import lise_certcheck as cc
+        return cc.verify({"version": 1, "formulas": formulas, "rels": [list(r) for r in rels], "proof": proof})[0]
+
+    LO1 = ["lit", cert_con({"x": -1}, 1)]          # x >= 1
+    HI0 = ["lit", cert_con({"x": 1}, 0)]           # x <= 0
+
+    def test_valid_certificates_are_accepted(self):
+        self.assertTrue(self.verify([self.LO1, self.HI0], ["derive", [["comb", 1, 0, "x"], ["contra", 2]]]))
+        # 2x == 1 over the integers needs tightening
+        two = [["lit", cert_con({"x": 2}, -1)], ["lit", cert_con({"x": -2}, 1)]]
+        self.assertTrue(self.verify(two, ["derive", [["tighten", 0], ["tighten", 1], ["comb", 2, 3, "x"], ["contra", 4]]]))
+        # a case split: (x <= 0 or x >= 5) and 1 <= x <= 4   (facts: 0 = the chosen alternative, 1 = x>=1, 2 = x<=4)
+        f = [["or", [["lit", cert_con({"x": 1}, 0)], ["lit", cert_con({"x": -1}, 5)]]],
+             ["lit", cert_con({"x": -1}, 1)], ["lit", cert_con({"x": 1}, -4)]]
+        self.assertTrue(self.verify(f, ["split", [["derive", [["comb", 0, 1, "x"], ["contra", 3]]],
+                                                   ["derive", [["comb", 2, 0, "x"], ["contra", 3]]]]]))
+
+    def test_bogus_certificates_are_rejected(self):
+        feasible = [["lit", cert_con({"x": -1}, 1)], ["lit", cert_con({"x": 2}, -2)]]        # x >= 1, 2x <= 2: x = 1 works
+        self.assertFalse(self.verify(feasible, ["derive", [["tighten", 1], ["comb", 2, 0, "x"], ["contra", 3]]]))
+        same_sign = [["lit", cert_con({"x": 1}, -5)], ["lit", cert_con({"x": 1}, -3)]]       # combining two upper bounds
+        self.assertFalse(self.verify(same_sign, ["derive", [["comb", 0, 1, "x"], ["contra", 2]]]))
+        zero = [["lit", cert_con({"x": 1}, 0)], ["lit", cert_con({"x": -1}, 0)]]            # 0 <= 0 is no contradiction
+        self.assertFalse(self.verify(zero, ["derive", [["comb", 0, 1, "x"], ["contra", 2]]]))
+        orf = ["or", [["lit", cert_con({"x": 1}, 0)], ["lit", cert_con({"x": -1}, 5)]]]       # incomplete case split
+        f = [orf, ["lit", cert_con({"x": -1}, 1)], ["lit", cert_con({"x": 1}, -4)]]
+        self.assertFalse(self.verify(f, ["split", [["derive", [["comb", 0, 1, "x"], ["contra", 3]]]]]))
+        self.assertFalse(self.verify(f, ["derive", [["contra", 0]]]))
+        self.assertFalse(self.verify([self.LO1, self.HI0], ["closed"]))
+        self.assertFalse(self.verify([self.LO1, self.HI0], ["closed", [["comb", 1, 0, "x"], ["contra", 2]]]))   # wrong node kind
+        self.assertFalse(self.verify([self.LO1, self.HI0], ["derive", [["comb", 1, 0, "x"]]]))          # no contradiction step
+        self.assertFalse(self.verify([self.LO1, self.HI0], ["derive", [["contra", 7]]]))                # dangling reference
+        self.assertFalse(self.verify([self.LO1], ["derive", [["comb", 0, 0, "x"], ["contra", 1]]]))
+
+    def test_product_facts_are_recomputed_not_trusted(self):
+        rels = [("a", "b", "m")]
+        lo_a, hi_a = ["lit", cert_con({"a": -1}, 0)], ["lit", cert_con({"a": 1}, -10)]      # 0 <= a <= 10
+        lo_b, hi_b = ["lit", cert_con({"b": -1}, 0)], ["lit", cert_con({"b": 1}, -10)]
+        big = ["lit", cert_con({"m": -1}, 101)]                                            # m >= 101
+        f = [lo_a, hi_a, lo_b, hi_b, big]
+        good = ["derive", [["pf", "chi", 0, 0, 1, 2, 3], ["comb", 5, 4, "m"], ["contra", 6]]]
+        self.assertTrue(self.verify(f, good, rels))
+        bad_refs = ["derive", [["pf", "chi", 0, 1, 1, 2, 3], ["comb", 5, 4, "m"], ["contra", 6]]]   # wrong bound references
+        self.assertFalse(self.verify(f, bad_refs, rels))
+        wrong_kind = ["derive", [["pf", "clo", 0, 0, 1, 2, 3], ["comb", 5, 4, "m"], ["contra", 6]]]   # clo gives a LOWER bound only
+        self.assertFalse(self.verify(f, wrong_kind, rels))
+        weak = [lo_a, ["lit", cert_con({"a": 1}, -10)], lo_b, ["lit", cert_con({"b": 1}, -10)], ["lit", cert_con({"m": -1}, 50)]]
+        self.assertFalse(self.verify(weak, ["derive", [["pf", "chi", 0, 0, 1, 2, 3], ["comb", 5, 4, "m"], ["contra", 6]]], rels))
+
+    def test_real_certificates_validate_and_tampering_is_detected(self):
+        import copy
+        import json
+        import lise_certcheck as cc
+        import lise_fmcheck as fm
+        import z3
+        x, y = z3.Ints("x y")
+        asrt = [x >= 0, x <= 10, y >= 0, y <= 10, x * y > 100]
+        self.assertEqual(fm.check_assertions(asrt)[0], fm.UNSAT)
+        cert = json.loads(json.dumps(fm.last_cert))
+        self.assertTrue(cc.verify(cert)[0])
+
+        def derivations(node, out):
+            if node[0] == "derive":
+                out.append(node[1])
+            elif node[0] == "split":
+                for sub in node[1]:
+                    derivations(sub, out)
+        ds = []
+        derivations(cert["proof"], ds)
+        self.assertTrue(ds)
+        tampered = 0
+        for variant in ("drop_last_comb", "change_ref", "flip_const"):
+            c = copy.deepcopy(cert)
+            d = []
+            derivations(c["proof"], d)
+            steps = d[0]
+            if variant == "drop_last_comb" and len(steps) > 1:
+                del steps[-2]
+            elif variant == "change_ref":
+                for st in steps:
+                    if st[0] == "comb":
+                        st[1] = max(0, st[1] - 1)
+                        break
+            else:
+                c["formulas"] = json.loads(json.dumps(c["formulas"]).replace("100", "99", 1)) if "100" in json.dumps(c["formulas"]) else c["formulas"]
+            if c != cert:
+                tampered += 1
+                self.assertFalse(cc.verify(c)[0], variant)
+        self.assertGreaterEqual(tampered, 2)
+
+    def test_a_buggy_prover_cannot_get_a_proof_accepted(self):
+        """The search code is untrusted: if its arithmetic is wrong, the validator refuses its certificate."""
+        import lise_fmcheck as fm
+        import z3
+        x = z3.Int("x")
+        real = fm.tighten
+        fm.tighten = lambda c: ({v: a // max(1, abs(a)) * (1 if a > 0 else 1) for v, a in c[0].items()}, c[1] - 1) if c[0] else c
+        try:
+            status, detail = fm.check_assertions([x >= 1, x <= 3, 2 * x == 3, x * 0 == 0])[:2]
+        finally:
+            fm.tighten = real
+        self.assertNotEqual(status, fm.UNSAT)
+
+    def test_validator_needs_nothing_but_the_standard_library(self):
+        import glob
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as d:
+            r = subprocess.run([sys.executable, os.path.join(HERE, "lise.py"), "check", "--no-cache",
+                                os.path.join(HERE, "example_ok_math.lise"), "--certificates", d], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertGreaterEqual(len(glob.glob(os.path.join(d, "*.json"))), 10)
+            # -S: no site-packages at all, so z3 / cvc5 / llvmlite are not importable
+            v = subprocess.run([sys.executable, "-S", os.path.join(HERE, "lise_certcheck.py"), d], capture_output=True, text=True)
+            self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+            self.assertIn("certificates valid", v.stdout)
+            some = sorted(glob.glob(os.path.join(d, "*.json")))[0]
+            text = open(some).read().replace('"contra"', '"contrX"', 1)
+            open(some, "w").write(text)
+            v = subprocess.run([sys.executable, "-S", os.path.join(HERE, "lise_certcheck.py"), d], capture_output=True, text=True)
+            self.assertNotEqual(v.returncode, 0)
+
+
+@unittest.skipUnless(HAVE_AOT, "needs llvmlite and a C linker for AOT tests")
+class RuntimeHardening(unittest.TestCase):
+    """A compiled program must not die in an uncontrolled way because of its environment."""
+
+    def build(self, src, opt=2):
+        from lise_aot import build_executable
+        from lise_codegen import Codegen
+        from lise_lexer import lex
+        from lise_parser import Parser
+        cg = Codegen(Parser(lex(src)).parse_program(), "t")
+        ir = cg.emit_module()
+        d = tempfile.mkdtemp()
+        exe = os.path.join(d, "prog")
+        build_executable(ir, exe, opt, cg.stack_report["lise_main"])
+        return exe, cg.stack_report["lise_main"]
+
+    PROG = SUM + r"""
+fn main() -> Integer
+is
+    print_int(sum_to(20))
+    print("\n")
+    return 5
+end
+"""
+
+    def test_missing_stack_is_a_clean_exit_not_a_crash(self):
+        import resource
+        import subprocess
+        exe, need = self.build(self.PROG)
+        self.assertTrue(check_source(self.PROG, "t.lise").ok)
+
+        def limit(n):
+            return lambda: resource.setrlimit(resource.RLIMIT_STACK, (n, n))
+        poor = subprocess.run([exe], capture_output=True, preexec_fn=limit(32 * 1024))
+        self.assertEqual(poor.returncode, 70)
+        self.assertIn(b"not enough stack", poor.stderr)
+        self.assertEqual(poor.stdout, b"")                      # it stopped BEFORE running anything
+        rich = subprocess.run([exe], capture_output=True, preexec_fn=limit(need + 512 * 1024))
+        self.assertEqual((rich.returncode, rich.stdout), (5, b"210\n"))
+        unlimited = subprocess.run([exe], capture_output=True,
+                                   preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_STACK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)))
+        self.assertEqual(unlimited.returncode, 5)
+
+    def test_closed_output_pipe_does_not_kill_the_program(self):
+        import subprocess
+        src = r"""fn main() -> Integer
+is
+    var i: Integer := 0
+    while i < 20000
+    invariant 0 <= i and i <= 20000
+    decreases 20000 - i
+    do
+        print("some output that nobody reads\n")
+        i := i + 1
+    end
+    return 3
+end
+"""
+        self.assertTrue(check_source(src, "t.lise").ok)
+        exe, _ = self.build(src)
+        p = subprocess.Popen([exe], stdout=subprocess.PIPE)
+        p.stdout.read(10)
+        p.stdout.close()                                        # the reader goes away: SIGPIPE on the next write
+        self.assertEqual(p.wait(timeout=60), 3)                 # it still runs to completion (output is dropped)

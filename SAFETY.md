@@ -31,16 +31,31 @@ the claim "safer than Ada". Read the gaps section before trusting anything.
    re-checked by cvc5. cvc5 `sat` is a hard "SOLVER DISAGREEMENT" error; cvc5
    `unknown`/timeout means the proof is *not accepted*. Dead-path pruning (which
    skips obligations) also needs both solvers to agree the path is dead.
-4. **A solver-free checker re-derives the arithmetic** (`lise_fmcheck.py`, ~250 lines, shares no
-   code with Z3/cvc5): case splitting plus exact Fourier-Motzkin elimination over the integers,
-   with `/` and `%` by literals linearised and everything nonlinear/array-valued abstracted (sound
-   for UNSAT). On the bundled examples it independently re-derives 144 of 161 obligations (89%);
-   it cannot do products of variables, modulus by a variable, or array reasoning. It only ever
-   answers "unsat" or "unknown", so it can add confidence but never reject by itself.
-   `--independent` makes it mandatory: every proof must be re-derived or the build fails
-   (the proof cache is ignored in that mode). The checker itself is property-tested against Z3
-   on thousands of random formulas (it must never call a satisfiable formula unsat) and
-   mutation-tested.
+4. **A solver-free checker is a gate, not a bystander** (`lise_fmcheck.py`, shares no code with
+   Z3/cvc5). For every obligation both solvers call proved it must reach a verdict itself:
+   *re-derived* (accepted), *counterexample* (it found an assignment and verified it by evaluating the
+   original formula with its own evaluator: **the build stops, even though both solvers said yes**),
+   or *unknown* (**rejected: fail closed**). Dead-path pruning needs the same three-way agreement.
+   **Every re-derivation is a certificate**: the search (untrusted, ~600 lines) writes its refutation
+   as data (case splits, then a list of exact steps: tighten, combine, product facts) and a separate
+   validator, `lise_certcheck.py` (~200 lines, standard library only: no solver, no Lise imports),
+   re-checks each step with exact integer arithmetic. A bug in the search can therefore not get a
+   bad proof accepted (tested by breaking the search on purpose). `lise.py check FILE --certificates DIR`
+   writes one JSON certificate per obligation; `python lise_certcheck.py DIR` validates them anywhere.
+   Techniques: case splitting; exact Fourier-Motzkin over the integers with gcd tightening and exact
+   (+-1) elimination; polynomial normal form with interval and McCormick bounds for products;
+   Euclid facts for `/` and `%` (by literals exactly, by variables via |x/n| <= |x|, 0 <= r < |n|);
+   read-over-write, constant arrays and Ackermann consistency for arrays; enums as bounded integers.
+   On the bundled examples and on fuzz-verified programs it re-derives 100% of the obligations. What it
+   still cannot do is rejected rather than trusted: e.g. `x*x*x*x >= 0` or `x*x + y*y >= 2*x*y` over
+   unbounded integers pass both solvers and are refused. The checker is property-tested against Z3 in
+   both directions on random formulas (never "unsat" for a satisfiable formula; every counterexample
+   it reports really satisfies the formula) and mutation-tested; the gate itself is tested by making
+   both solvers lie.
+4b. **Developer-mistake guards are errors**: unused variables/parameters (`_name` opts out, which also
+   catches ignored results), contradictory preconditions (every proof would be vacuous), code no path
+   reaches, branches that are always/never taken, self-assignment. Unreachability is only reported when
+   all three engines agree the path is dead.
 5. **Trap backstop.** The proven obligations (overflow, bounds, division) are
    also compiled in as trap-on-violation (`llvm.trap`). They never fire in a
    correctly verified program; if the verifier or backend ever has a bug, the
@@ -65,10 +80,15 @@ the claim "safer than Ada". Read the gaps section before trusting anything.
    verifier accepts is also run on it: it must never get stuck, and its result and output must
    equal both the fuzzer's independent reference and the compiled code (three evaluators). Native
    binaries are compared with it on all examples.
-10. **The fuzzer, the checker and the semantics are mutation-tested** (`python mutation_test.py`): thirty
+10. **Ownership is fuzzed** (`python fuzz_own.py N`): random programs move, borrow, alias and mutate
+    records; every program the verifier accepts must be free of ownership violations when run on the
+    reference semantics, which decides aliasing by actual storage rather than by names. Seven
+    planted ownership bugs (moves not recorded, aliasing allowed, immutables assignable, borrowed
+    parameters movable, loop moves, moved-argument reads) are all caught.
+11. **The fuzzers, the checker and the semantics are mutation-tested** (`python mutation_test.py`): sixty-one
    deliberately planted bugs (missing/weakened overflow, division, bounds,
    assert, postcondition and invariant proofs; three frame-rule mistakes; wrong
-   backend instructions) must all be caught. All thirty are caught today (fourteen backend/recursion/checker/semantics ones by named unit tests, since random
+   backend instructions) must all be caught. The ones added in the last two rounds (checker, gate, developer guards, certificate validator, runtime hardening) were re-run and are all caught; the older ones were last confirmed before the gate and guards were added, so re-run `python mutation_test.py` before relying on this claim (twenty-nine backend/recursion/checker/semantics ones by named unit tests, since random
    programs cannot observe a stack-depth error), but
    the two array-bounds mutants are hit only ~1-2 times per 150 seeds: thin margin. Getting there
    needed template-based "one risky construct" programs: a purely random
@@ -84,10 +104,29 @@ the claim "safer than Ada". Read the gaps section before trusting anything.
   because they are never executed (erased). A division by zero inside a contract
   is still an error. Programs cannot observe the difference.
 
+## Runtime robustness: what "it cannot crash" can and cannot mean
+
+No language can promise that a process is never killed. What Lise promises is narrower and checkable:
+**nothing you can write in Lise makes a compiled program crash**, and the environment-caused failures
+that remain are turned into early, explained, controlled exits.
+
+| Way a program can die | Status |
+|---|---|
+| Overflow, bad index, division by zero, uninitialised or dangling data, data races (no threads yet) | impossible by proof (and re-checked by the backstop below) |
+| Infinite loop / infinite recursion | proven absent (`decreases`; recursion needs a bound) |
+| Stack overflow | worst-case stack is bounded at build time; **at start-up the program checks the OS stack limit and exits with status 70 and a message if it is too small**, before running any code |
+| Heap exhaustion | there is no heap |
+| Closed output pipe (SIGPIPE) | ignored: output is dropped, the program keeps running |
+| A proven check fails anyway (a verifier/backend bug) | the backstop stops it with a message and **exit status 71**, never an illegal-instruction crash or memory corruption |
+| Killed from outside (OOM-killer, `kill`, power loss), hardware faults, kernel bugs | cannot be prevented by a language |
+| Bugs in LLVM, the linker, libc, or in Lise's own verifier/checkers | reduced by the layers above, not eliminated (see below) |
+
 ## Trusted computing base (what you must still trust)
 
 - **Z3 and cvc5** (a false proof is accepted only if BOTH have a soundness bug on the
   same query; cvc5 runs with `arrays-exp`, an experimental option needed for constant arrays)
+- **The certificate validator** (`lise_certcheck.py`, ~200 lines, standard library only) and the
+  translation of obligations into the checker's input; the search that produces certificates is NOT trusted.
 - **The verifier** (`lise_verify.py`, ~1,200 lines of Python): its encoding of
   Lise semantics into SMT. No independent proof checker exists yet.
 - **The backend** (`lise_codegen.py`) and **LLVM** (optimiser + code generator),
@@ -110,9 +149,10 @@ stack bound, ownership). On *assurance evidence* it is far behind. **The claim
 
 ## What would justify the claim (roadmap, in priority order)
 
-1. *(partly done)* Independent checking: a solver-free checker re-derives the linear-integer core
-   (89% of obligations on the examples). Still missing: checking real proof certificates, and
-   covering products, modulus by variables and arrays.
+1. *(mostly done)* Independent checking, now with checkable certificates for the arithmetic core: a solver-free checker is now a fail-closed gate with its own
+   counterexample search (100% of obligations on the examples and fuzz-verified programs). Still
+   missing: checking the SOLVERS' own proof objects (Z3/cvc5 emit them; the validator would need to
+   understand them), formally verifying the validator in a proof assistant, and deeper nonlinear reasoning.
 2. *(done)* Cross-check every obligation with a second solver (cvc5).
 3. *(partly done)* Written semantics: `SEMANTICS.md` + an executable interpreter, tested against the
    verifier and the backend. Still missing: a *mechanised* semantics (a proof assistant), and an

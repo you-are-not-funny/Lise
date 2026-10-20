@@ -8,7 +8,7 @@ error, never a pass.
 
 ## Status: Phase 1 reference compiler (frontend + verifier)
 
-Working and tested (137 tests):
+Working and tested (161 tests):
 
 - Lexer, parser, AST
 - Refinement types, generics (type params and value params like `N: PositiveSize`)
@@ -68,17 +68,31 @@ parameters or constants.
 
 ## Safety (priority #1)
 
+**Fail closed.** A proof is accepted only if Z3, cvc5 *and* the solver-free checker all agree. If the
+checker can re-derive an obligation it must; if it finds a counterexample (and verifies it by evaluating
+the original formula) the build stops even when both solvers said yes; if it cannot decide, the proof is
+rejected ("Lise rejects what it cannot double-check"). **Developer-mistake guards** are build errors,
+not warnings: unused variables and parameters (use `_name` to ignore on purpose, which also catches
+ignored results), contradictory preconditions, code that can never run, always-true/never-true
+conditions, self-assignment. There are no flags to turn any of this off.
+
+
 There is exactly one Lise: no unchecked mode, no suppress pragma, no unsafe
 escape. Everything is checked at compile time: every proof must be confirmed by
-two independent solvers (Z3 and cvc5) plus a small solver-free checker (`lise_fmcheck.py`), builds never trust the proof cache, the
+two independent solvers (Z3 and cvc5) AND a small solver-free checker (`lise_fmcheck.py`) that must
+re-derive it itself, or find a counterexample and stop the build, builds never trust the proof cache, the
 worst-case stack is bounded statically, and the verifier is fuzzed against a
 reference interpreter (`python fuzz_lise.py 200`) whose own sensitivity is
-mutation-tested (`python mutation_test.py`, 30 planted bugs). The proven obligations remain in the
+mutation-tested (`python mutation_test.py`, 61 planted bugs). The proven obligations remain in the
 binary only as a trap backstop that never fires in correct code. See
 [SAFETY.md](SAFETY.md) for guarantees, the trusted base, and honest gaps.
 
 [SEMANTICS.md](SEMANTICS.md) defines what a program means; `python lise.py interpret FILE` runs it
 under that executable reference semantics (`lise_semantics.py`).
+
+**Compiled programs fail safe.** They check the OS stack limit at start-up (exit 70 with a message
+instead of a crash later), ignore SIGPIPE, and if a proven check ever fails (a compiler bug) stop with
+exit status 71 and a message. See SAFETY.md for what "cannot crash" does and does not mean.
 
 ## Run it
 
@@ -93,7 +107,7 @@ under that executable reference semantics (`lise_semantics.py`).
     python lise.py run example_ok_queue_main.lise # verified generic ring buffer, native (exit 42)
     python -m unittest -v      # backend tests need: pip install llvmlite
 
-Options: `--independent` (strict: every proof must also be re-derived by the solver-free checker), `--timeout-ms N`, `--no-cache`, `-O0..-O3`, `-o OUT`, `--stack-limit N`.
+Options: `--certificates DIR` (write a checkable proof certificate per obligation), `--timeout-ms N`, `--no-cache`, `-O0..-O3`, `-o OUT`, `--stack-limit N`.
 Native builds need `llvmlite` and `gcc`/`cc`/`clang` on PATH.
 
 ## Files
@@ -109,10 +123,12 @@ Native builds need `llvmlite` and `gcc`/`cc`/`clang` on PATH.
 | `lise.py` | CLI (`check`, `build`) |
 | `test_lise.py` | tests |
 | `fuzz_lise.py` | differential soundness fuzzer (verifier + backend vs reference) |
+| `fuzz_own.py` | fuzzer for the ownership rules (moves, borrowing, aliasing, mutability) |
 | `mutation_test.py` | plants known bugs; the fuzzer must catch every one |
 | `lise_semantics.py` | executable reference semantics: the normative meaning of a program |
 | `SEMANTICS.md` | the semantics in prose: stuck states, what is and is not covered |
 | `lise_xcheck.py` | second-solver (cvc5) confirmation of every proof |
+| `lise_certcheck.py` | standalone certificate validator (standard library only): the small trusted core for arithmetic proofs |
 | `lise_fmcheck.py` | solver-free checker (exact integer arithmetic) that re-derives the linear core of proofs |
 | `SAFETY.md` | safety case: guarantees, trusted base, gaps, roadmap |
 | `example_*.lise` | `ok` must verify, `fail` must be rejected |

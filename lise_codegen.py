@@ -3,7 +3,8 @@
 Every overflow / bounds / division obligation is proven by the verifier before
 any code is generated.  There is exactly ONE kind of Lise program: there is no
 unchecked mode and no way to turn the safety rules off.  The proven obligations
-are additionally kept as a trap-on-violation backstop (llvm.trap).  In a
+are additionally kept as a backstop: a check that fires stops the program with a message and exit
+status 71 (never an illegal-instruction crash).  In a
 correctly verified program a backstop never fires; if the verifier or backend
 ever has a bug, the program stops instead of corrupting memory.
 Arithmetic never uses nsw/nuw, so it cannot produce LLVM poison/UB.
@@ -73,9 +74,7 @@ def mangle(s):
     return re.sub(r"[^A-Za-z0-9_]", "_", s)
 
 
-RUNTIME_WRITE = """declare i64 @write(i32, ptr, i64)
-
-define internal void @lise_write(ptr %p, i64 %n) {
+RUNTIME_WRITE = """define internal void @lise_write(ptr %p, i64 %n) {
 entry:
   br label %loop
 loop:
@@ -95,6 +94,22 @@ exit:
   ret void
 }
 """.split("\n")
+
+# A failed safety backstop (a proven check that should be impossible) ends the program with a clear
+# message and exit status 71 instead of an illegal-instruction crash.
+PANIC_MESSAGE = b"lise: internal safety check failed (a compiler or verifier bug); the program was stopped. Please report it.\n"
+_PANIC_BYTES = "".join(f"\\{b:02X}" for b in PANIC_MESSAGE)
+RUNTIME_PANIC = [
+    f'@.lise.panic = private unnamed_addr constant [{len(PANIC_MESSAGE)} x i8] c"{_PANIC_BYTES}"',
+    "declare void @_exit(i32) noreturn",
+    "define internal void @lise_panic() noreturn {",
+    "entry:",
+    f"  %r = call i64 @write(i32 2, ptr @.lise.panic, i64 {len(PANIC_MESSAGE)})",
+    "  call void @_exit(i32 71)",
+    "  unreachable",
+    "}",
+    "",
+]
 
 # Decimal conversion on the unsigned magnitude (so INT64_MIN works); at most 19 digits plus '-'
 # fit in the 24-byte buffer, filled from the end.
@@ -139,6 +154,7 @@ class Codegen:
         self.stack_limit = stack_limit
         self.frames, self.edges, self.intr, self.names = {}, {}, set(), {}
         self.need_memcpy = False
+        self.uses_trap = False
         self.dec_max = {}
         self.strings, self.uses_print, self.uses_print_int = [], False, False
         self.types = {d.name: d for d in prog.decls if isinstance(d, TypeDecl)}
@@ -361,6 +377,8 @@ class Codegen:
             fn, bindings, sym = self.queue.pop(0)
             fn_lines.extend(self.emit_fn(fn, bindings, sym))
             fn_lines.append("")
+        if self.uses_trap:
+            self.frames["lise_panic"], self.edges["lise_panic"], self.names["lise_panic"] = 16, set(), "panic"
         if self.uses_print:
             self.frames["lise_write"], self.edges["lise_write"], self.names["lise_write"] = 16, set(), "print"
         if self.uses_print_int:
@@ -371,7 +389,8 @@ class Codegen:
         out.extend(self.type_defs)
         if self.type_defs:
             out.append("")
-        out.append("declare void @llvm.trap() noreturn nounwind")
+        if self.uses_print or self.uses_trap:
+            out.append("declare i64 @write(i32, ptr, i64)")
         for name in sorted(self.intr):
             out.append(f"declare {{i64, i1}} @llvm.{name}.with.overflow.i64(i64, i64)")
         out.append("")
@@ -383,6 +402,8 @@ class Codegen:
             out.append(f'{label} = private unnamed_addr constant [{len(data)} x i8] c"{body}"')
         if self.strings:
             out.append("")
+        if self.uses_trap:
+            out.extend(RUNTIME_PANIC)
         if self.uses_print:
             out.extend(RUNTIME_WRITE)
         if self.uses_print_int:
@@ -433,6 +454,7 @@ class Codegen:
         self.n = 0
         self.body, self.allocas, self.scopes, self.term = [], [], [{}], False
         self.alloca_tys, self.trap_lbl, self.cur_edges = [], None, set()
+        self.fn_uses_trap = False
         self.subst = self.as_subst(bindings)
         ret = self.resolve(fn.ret, self.subst) if fn.ret else VOID
         self.ret_ty = ret
@@ -462,7 +484,7 @@ class Codegen:
                 self.o(f"br label %{self.trap()}  ; proven unreachable; trap if the proof was wrong")
             self.term = True
         if self.trap_lbl:
-            self.body.extend([f"{self.trap_lbl}:", "  call void @llvm.trap()", "  unreachable"])
+            self.body.extend([f"{self.trap_lbl}:", "  call void @lise_panic()", "  unreachable"])
         frame = 0
         for t in self.alloca_tys:
             sz, al = self.size_align(t)
@@ -485,6 +507,8 @@ class Codegen:
     def trap(self):
         if self.trap_lbl is None:
             self.trap_lbl = "trap"
+            self.uses_trap = True
+            self.cur_edges.add("lise_panic")
         return self.trap_lbl
 
     def guard(self, bad):

@@ -919,7 +919,7 @@ def run_seed(seed):
     from lise_verify import check_source
     p = gen_program(seed)
     src = render(p)
-    rep = check_source(src, f"fuzz{seed}.lise", timeout_ms=3000)
+    rep = check_source(src, f"fuzz{seed}.lise", timeout_ms=3000, independent="report", lints=False)
     if not rep.ok:
         return "rejected", src
     prog = Parser(lex(src)).parse_program()
@@ -981,8 +981,9 @@ def main():
                 else:
                     stats[st] = stats.get(st, 0) + 1
         if r.returncode != 0 and last_start is not None and last_start not in done:
-            if r.returncode < 0:      # killed by a signal: a trap/crash inside code the verifier accepted
-                bugs.append((last_start, f"BUG(killed by signal {-r.returncode}: trap/crash in verified code)"))
+            if r.returncode < 0 or r.returncode == 71:   # a signal, or the safety backstop (exit 71) in accepted code
+                what = f"signal {-r.returncode}" if r.returncode < 0 else "the safety backstop (exit 71)"
+                bugs.append((last_start, f"BUG(stopped by {what}: a proven check failed in verified code)"))
                 done.add(last_start)
             else:                     # a Python exception in the harness itself: not a finding, fix the fuzzer
                 print(f"HARNESS ERROR at seed {last_start}:\n{r.stderr[-1200:]}")

@@ -35,13 +35,22 @@ is
     return is_even(n - 1)
 end
 
+fn describe(n: Integer where value >= 0 and value <= 50)
+is
+    print_int(n)
+    if is_even(n) then
+        print(" is even\n")
+    else
+        print(" is odd\n")
+    end
+end
+
 fn main() -> Integer
 is
     print("sum_to(20) = ")
     print_int(sum_to(20))
     print("\n")
-    if is_even(40) and is_odd(37) then
-        print("parity ok\n")
-    end
+    describe(40)
+    describe(37)
     return 0
 end

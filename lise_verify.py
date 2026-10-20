@@ -18,7 +18,7 @@ from lise_ast import walk, fmt_expr, fmt_type
 from lise_lexer import LiseError, lex
 from lise_parser import Parser
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 I64_MIN = -(2 ** 63)
 I64_MAX = 2 ** 63 - 1
 BUILTIN_TYPES = {"Integer", "Bool", "Void", "Array", "Outcome"}
@@ -152,7 +152,10 @@ class Verifier:
         self.enums = {}      # name -> (sort, {variant: const})
         self.counters = {}
         self._mods = {}
-        self.require_independent = False
+        self.independent = "require"
+        self.cert_dir = None                 # write every validated certificate here (lise.py --certificates DIR)
+        self.lints = True                    # developer-mistake guards (errors); only test harnesses switch them off
+        self.lint_seen, self.branch_msg, self.branch_live = set(), {}, set()
         self.agg_call_ok = False   # set only while a typed declaration evaluates its initialiser
         self.entry_consts = []
         self.tenv = {}
@@ -195,10 +198,24 @@ class Verifier:
                 fm_status, fm_detail = lise_fmcheck.check(s)
                 if fm_status == lise_fmcheck.UNSAT:
                     self.rep.fm_confirmed += 1
-                elif self.require_independent:
-                    self.diag(loc, msg, ["strict mode (--independent): this proof was not re-derived by the "
-                                         f"independent checker ({fm_detail}); it needs nonlinear or array "
-                                         "reasoning outside the checker's fragment"])
+                    if self.cert_dir:
+                        self.write_certificate(msg, loc)
+                elif fm_status == lise_fmcheck.INVALID:
+                    self.diag(loc, msg, ["INTERNAL ERROR in the independent checker: it claimed a proof but its own "
+                                         f"certificate failed validation ({fm_detail}). The proof is NOT accepted."])
+                    st.pc.append(goal)
+                    return False
+                elif fm_status == lise_fmcheck.SAT:
+                    self.diag(loc, msg, ["INDEPENDENT CHECKER DISAGREES: both solvers said this holds, but the "
+                                         f"solver-free checker found and verified a counterexample ({fm_detail}). "
+                                         "A solver or the verifier's encoding is wrong; the proof is NOT accepted."])
+                    st.pc.append(goal)
+                    return False
+                elif self.independent == "require":
+                    self.diag(loc, msg, ["not independently confirmed: the solvers accept this, but the solver-free "
+                                         f"checker could not re-derive it ({fm_detail}). Lise rejects what it cannot "
+                                         "double-check; restructure the code (simpler arithmetic, explicit bounds, "
+                                         "smaller expressions) or add intermediate asserts."])
                     st.pc.append(goal)
                     return False
             elif status == lise_xcheck.SAT:
@@ -236,6 +253,44 @@ class Verifier:
             return True
         return self.prove(st, goal, msg, loc)
 
+    def write_certificate(self, msg, loc):
+        import json
+        os.makedirs(self.cert_dir, exist_ok=True)
+        self.cert_n = getattr(self, "cert_n", 0) + 1
+        cert = dict(lise_fmcheck.last_cert)
+        cert["meta"] = {"file": self.filename, "function": self.fn.name, "obligation": msg, "line": loc[0]}
+        with open(os.path.join(self.cert_dir, f"{self.fn.name}-{self.cert_n:04d}.json"), "w", encoding="utf-8") as fh:
+            json.dump(cert, fh)
+
+    def lint(self, loc, msg):
+        """A developer-mistake guard: reported as an error (it fails the build) unless a test harness disabled it."""
+        if self.lints and (loc, msg) not in self.lint_seen:
+            self.lint_seen.add((loc, msg))
+            self.diag(loc, "lint: " + msg)
+
+    def unused_lints(self, fn):
+        assign_roots, assigned = set(), set()
+        for n in walk(fn.body):
+            if isinstance(n, Assign):
+                root = n.target
+                while isinstance(root, (Field, Index)):
+                    root = root.obj
+                if isinstance(root, Name):
+                    assign_roots.add(id(root))
+                    assigned.add(root.ident)
+                if isinstance(n.value, Name) and isinstance(n.target, Name) and n.value.ident == n.target.ident:
+                    self.lint(n.loc, f"'{n.target.ident}' is assigned to itself")
+        reads = {n.ident for n in walk(fn.body) if isinstance(n, Name) and id(n) not in assign_roots}
+        in_contracts = {n.ident for n in walk([fn.requires, fn.ensures, fn.decreases]) if isinstance(n, Name)}
+        for n in walk(fn.body):
+            if isinstance(n, Let) and not n.name.startswith("_") and n.name not in reads:
+                self.lint(n.loc, f"variable '{n.name}' is never read (if you are ignoring a result on purpose, "
+                                 f"name it '_{n.name}')")
+        for p in fn.params:
+            if not p.name.startswith("_") and p.name not in reads and p.name not in assigned \
+                    and p.name not in in_contracts:
+                self.lint(p.loc, f"parameter '{p.name}' is never used (rename it '_{p.name}' if that is intended)")
+
     def feasible(self, st):
         s = z3.Solver()
         s.set("timeout", 2000)
@@ -243,8 +298,11 @@ class Verifier:
             s.add(p)
         if s.check() != z3.unsat:
             return True
-        # Z3 says the path is dead: only prune it if cvc5 agrees (pruning skips obligations).
-        return lise_xcheck.check(s, 4000)[0] != lise_xcheck.UNSAT
+        # Z3 says the path is dead: prune it (skipping its obligations) only if cvc5 AND the
+        # independent checker both agree; otherwise keep the path and prove its obligations.
+        if lise_xcheck.check(s, 4000)[0] != lise_xcheck.UNSAT:
+            return True
+        return lise_fmcheck.check(s)[0] != lise_fmcheck.UNSAT
 
     # ---------------- helpers on expressions
     def path_of(self, e):
@@ -868,6 +926,9 @@ class Verifier:
                 nxt.extend(self.exec_stmt(s, st))
             live = nxt
             if not live:
+                rest = stmts[stmts.index(s) + 1:] if s in stmts else []
+                if rest:
+                    self.lint(getattr(rest[0], "loc", (0, 0)), "unreachable code: no execution can get past the previous statement")
                 break
         for st in live:
             for n in [n for n in st.vars if n not in names0]:
@@ -924,18 +985,28 @@ class Verifier:
         if isinstance(s, If):
             out = []
             cur = st
-            for cond, body in s.branches:
+            sid = id(s)
+            for i, (cond, _) in enumerate(s.branches):
+                self.branch_msg.setdefault((sid, i), (cond.loc, f"unreachable code: the condition `{fmt_expr(cond)}` "
+                                                               "can never be true here"))
+            last = s.branches[-1][0]
+            self.branch_msg.setdefault((sid, "else"), (s.else_body[0].loc if s.else_body else last.loc, (
+                "unreachable code: the `else` branch can never run (the conditions above are always true here)"
+                if s.else_body else f"the condition `{fmt_expr(last)}` is always true here: this `if` can never be skipped")))
+            for i, (cond, body) in enumerate(s.branches):
                 c = self.ev(cond, cur)
                 self.expect_bool(c, cond)
                 then_st = cur.fork(c)
                 nxt = cur.fork(z3.Not(c))
                 if self.feasible(then_st):
+                    self.branch_live.add((sid, i))
                     out.extend(self.exec_block(body, then_st))
                 cur = nxt
                 if not self.feasible(cur):
                     cur = None
                     break
             if cur is not None:
+                self.branch_live.add((sid, "else"))
                 out.extend(self.exec_block(s.else_body, cur) if s.else_body is not None else [cur])
             return out
         if isinstance(s, While):
@@ -1318,6 +1389,8 @@ class Verifier:
 
     def verify_fn(self, fn):
         self.fn = fn
+        self.branch_msg, self.branch_live = {}, set()
+        self.unused_lints(fn)
         self.entry_consts = []
         st = State()
         self.tenv = self.setup_generics(fn.gparams, st)
@@ -1340,6 +1413,9 @@ class Verifier:
             self.expect_bool(g, r)
             st.pc.append(g)
         st.old_env = dict(st.env)
+        if self.lints and not self.feasible(st):
+            self.lint(fn.loc, f"the preconditions of '{fn.name}' (with its parameter types) are contradictory: no call "
+                              "can satisfy them, so every proof inside it would be vacuous")
         self.entry_measure = None
         if fn.decreases is not None:
             m = self.ev(fn.decreases, st, spec=True)
@@ -1355,6 +1431,9 @@ class Verifier:
                 self.do_return(e, self.void_val, fn.end_loc)
             else:
                 self.prove(e, z3.BoolVal(False), f"function '{fn.name}' may reach its end without returning a value", fn.end_loc)
+        for key, (loc, msg) in self.branch_msg.items():       # a branch no path ever reached
+            if key not in self.branch_live:
+                self.lint(loc, msg)
 
     def run(self):
         try:
@@ -1390,7 +1469,8 @@ class Verifier:
                     self.cache.add(key)
 
 
-def check_source(src, filename="<input>", timeout_ms=10000, cache=None, require_independent=False):
+def check_source(src, filename="<input>", timeout_ms=10000, cache=None, independent="require", lints=True,
+                 cert_dir=None):
     rep = Report(filename)
     try:
         toks = lex(src)
@@ -1399,6 +1479,8 @@ def check_source(src, filename="<input>", timeout_ms=10000, cache=None, require_
         rep.diags.append(Diag(filename, ex.loc, ex.msg))
         return rep
     v = Verifier(prog, toks, filename, timeout_ms, cache, rep)
-    v.require_independent = require_independent
+    v.lints = lints
+    v.cert_dir = cert_dir
+    v.independent = independent     # "require" (always, for real builds) or "report" (fuzzing harness only)
     v.run()
     return rep

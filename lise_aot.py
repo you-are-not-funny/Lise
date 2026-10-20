@@ -20,19 +20,60 @@ class AotError(Exception):
     pass
 
 
-def entry_wrapper(ir):
-    """Append the C-ABI `main` that calls @lise_main. Rejects a bad Lise main."""
+STACK_SLACK = 128 * 1024        # C runtime start-up, argv/environment, signal frames
+EXIT_STACK = 70                 # EX_SOFTWARE: the program cannot run here; reported before it starts
+SIGPIPE, RLIMIT_STACK = 13, 3   # the same numbers on Linux and macOS
+
+
+def entry_wrapper(ir, stack_need=None):
+    """Append the C-ABI `main` that calls @lise_main. Rejects a bad Lise main.
+
+    The wrapper makes the program robust against the environment, so that it never dies half-way:
+      * it first checks that the OS stack limit covers the program's proven worst-case stack use
+        (`stack_need`); if not it exits at once with status 70 and a message (a controlled failure
+        at start-up instead of a crash at an arbitrary later point);
+      * it ignores SIGPIPE, so a closed output pipe drops output instead of killing the program."""
     marker = "define i64 @lise_main()"
     if marker not in ir:
         raise AotError("an executable needs `fn main() -> Integer` with no parameters")
-    return ir + (
-        "\ndefine i32 @main() {\n"
-        "entry:\n"
-        "  %r = call i64 @lise_main()\n"
-        "  %c = trunc i64 %r to i32\n"
-        "  ret i32 %c\n"
-        "}\n"
-    )
+    out = ["", "declare i32 @getrlimit(i32, ptr)", "declare ptr @signal(i32, ptr)"]
+    if "declare i64 @write(" not in ir:
+        out.append("declare i64 @write(i32, ptr, i64)")
+    need = (stack_need or 0) + STACK_SLACK
+    msg = (f"lise: not enough stack: this program needs at least {-(-need // 1024)} KiB "
+           f"(raise the limit, e.g. `ulimit -s {-(-need // 1024)}`)\n").encode()
+    body = "".join(f"\\{b:02X}" for b in msg)
+    out.append(f'@.lise.stackmsg = private unnamed_addr constant [{len(msg)} x i8] c"{body}"')
+    out.append("define i32 @main() {")
+    out.append("entry:")
+    if stack_need is not None:
+        out += [
+            "  %rl = alloca [2 x i64]",
+            f"  %gr = call i32 @getrlimit(i32 {RLIMIT_STACK}, ptr %rl)",
+            "  %known = icmp eq i32 %gr, 0",
+            "  br i1 %known, label %chk, label %run",
+            "chk:",
+            "  %cur = load i64, ptr %rl",
+            "  %unlimited = icmp ugt i64 %cur, 4611686018427387904",
+            f"  %enough = icmp uge i64 %cur, {need}",
+            "  %fine = or i1 %unlimited, %enough",
+            "  br i1 %fine, label %run, label %fail",
+            "fail:",
+            f"  %w = call i64 @write(i32 2, ptr @.lise.stackmsg, i64 {len(msg)})",
+            f"  ret i32 {EXIT_STACK}",
+        ]
+    else:
+        out.append("  br label %run")
+    out += [
+        "run:",
+        f"  %sig = call ptr @signal(i32 {SIGPIPE}, ptr inttoptr (i64 1 to ptr))",
+        "  %r = call i64 @lise_main()",
+        "  %c = trunc i64 %r to i32",
+        "  ret i32 %c",
+        "}",
+        "",
+    ]
+    return ir + "\n".join(out)
 
 
 def find_linker():
@@ -66,9 +107,9 @@ def compile_object(ir, opt=2, triple=None):
     return tm.emit_object(mod)
 
 
-def build_executable(ir, out_path, opt=2):
-    """Full AOT build. Returns out_path."""
-    obj = compile_object(entry_wrapper(ir), opt=opt)
+def build_executable(ir, out_path, opt=2, stack_need=None):
+    """Full AOT build. Returns out_path.  `stack_need` = the proven worst-case stack bound of main (bytes)."""
+    obj = compile_object(entry_wrapper(ir, stack_need), opt=opt)
     linker = find_linker()
     with tempfile.TemporaryDirectory() as d:
         o = os.path.join(d, "lise.o")

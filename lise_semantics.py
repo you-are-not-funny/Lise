@@ -13,6 +13,12 @@ normative description of what a Lise program means:
   * Memory is initialised by construction; records/arrays are never copied (they are moved or
     borrowed), `mutable` parameters alias the caller's storage.
 
+  * Ownership is dynamic here: a value of a non-Copy type (record, array, generic parameter type) is
+    MOVED when used by value in an owning position (declaration, assignment, return, `consume`
+    argument, constructor / fill argument); reading a moved variable, moving a borrowed (`in` /
+    `mutable`) parameter or a field/element, assigning to an immutable variable, and passing a
+    `mutable` argument whose storage overlaps another argument are all STUCK (kind "ownership").
+
 A program the verifier accepts must never get STUCK.  Anything the interpreter prints or returns
 must equal what the compiled program does.  Both claims are tested (test_lise.py, fuzz_lise.py).
 """
@@ -72,6 +78,7 @@ class Desc:
     def __init__(self, kind, **kw):
         self.kind, self.preds = kind, []
         self.elem = self.length = self.decl = self.renv = self.name = None
+        self.affine = kind in ("array", "record")     # non-Copy: moved when used by value
         self.__dict__.update(kw)
 
     def with_pred(self, pred, genv):
@@ -82,8 +89,9 @@ class Desc:
 
 # ------------------------------------------------------------------ storage slots (for lvalues)
 class Cell:
-    def __init__(self, value, desc):
+    def __init__(self, value, desc, mutable=True, borrowed=False):
         self.value, self.desc = value, desc
+        self.mutable, self.borrowed, self.moved = mutable, borrowed, False
 
     def get(self):
         return self.value
@@ -95,6 +103,7 @@ class Cell:
 class FieldSlot:
     def __init__(self, rec, name):
         self.rec, self.name, self.desc = rec, name, rec.fdescs[name]
+        self.mutable, self.borrowed, self.moved = True, False, False
 
     def get(self):
         return self.rec.fields[self.name]
@@ -106,6 +115,7 @@ class FieldSlot:
 class IndexSlot:
     def __init__(self, arr, i):
         self.arr, self.i, self.desc = arr, i, arr.desc.elem
+        self.mutable, self.borrowed, self.moved = True, False, False
 
     def get(self):
         return self.arr.items[self.i]
@@ -119,6 +129,7 @@ class RefSlot:
 
     def __init__(self, inner, desc):
         self.inner, self.desc = inner, desc
+        self.mutable, self.borrowed, self.moved = True, True, False
 
     def get(self):
         return self.inner.get()
@@ -135,7 +146,8 @@ class Frame:
 
 # ------------------------------------------------------------------ the machine
 class Machine:
-    def __init__(self, prog, step_limit=2_000_000, depth_limit=20_000):
+    def __init__(self, prog, step_limit=2_000_000, depth_limit=20_000, ownership=True):
+        self.own = ownership
         self.types = {d.name: d for d in prog.decls if isinstance(d, TypeDecl)}
         self.records = {d.name: d for d in prog.decls if isinstance(d, RecordDecl)}
         self.enums = {d.name: d for d in prog.decls if isinstance(d, EnumDecl)}
@@ -309,6 +321,8 @@ class Machine:
         if isinstance(e, Str):
             raise Stuck("type", "string literal outside print", e.loc)
         if isinstance(e, Name):
+            if self.own and not spec and e.ident in fr.env and fr.env[e.ident].moved:
+                raise Stuck("ownership", f"use of moved value '{e.ident}'", e.loc)
             return self.lookup(fr, e.ident, e.loc)
         if isinstance(e, Field):
             if isinstance(e.obj, Name) and e.obj.ident in self.enums and not self.in_scope(fr, e.obj.ident):
@@ -354,6 +368,92 @@ class Machine:
         return {"<": lambda: a < b, "<=": lambda: a <= b, ">": lambda: a > b, ">=": lambda: a >= b,
                 "==": lambda: a == b, "!=": lambda: a != b}[op]()
 
+    # ---------------------------------------------------------------- ownership (dynamic)
+    def ev_owned(self, e, fr):
+        """Evaluate `e` in an owning position: a non-Copy variable is moved out."""
+        v = self.ev(e, fr)
+        if not self.own:
+            return v
+        if isinstance(e, Name) and e.ident in fr.env:
+            cell = fr.env[e.ident]
+            if cell.desc is not None and cell.desc.affine:
+                if cell.borrowed:
+                    raise Stuck("ownership", f"cannot move '{e.ident}': it is a borrowed parameter", e.loc)
+                cell.moved = True
+        elif isinstance(e, (Field, Index)):
+            slot = self.try_slot(e, fr)
+            if slot is not None and slot.desc is not None and slot.desc.affine:
+                raise Stuck("ownership", f"cannot move {fmt_expr(e)} out of a field or element", e.loc)
+        return v
+
+    @staticmethod
+    def opaque(d):
+        c = copy.copy(d)
+        c.affine = True
+        return c
+
+    def try_slot(self, e, fr):
+        try:
+            return self.lvalue(e, fr)
+        except Stuck:
+            return None
+
+    def root_name(self, e):
+        while isinstance(e, (Field, Index)):
+            e = e.obj
+        return e.ident if isinstance(e, Name) else None
+
+    @staticmethod
+    def base_cell(c):
+        while isinstance(c, RefSlot):
+            c = c.inner
+        return c
+
+    def storage_of(self, e, fr):
+        """Storage locations an expression denotes/reads, as tuples; overlap is decided on these."""
+        out = set()
+        if isinstance(e, Name):
+            c = fr.env.get(e.ident)
+            if c is not None:
+                b = self.base_cell(c)
+                out.add(("c", id(b)))
+                v = c.get()
+                if isinstance(v, (Rec, Arr)):
+                    out.add(("o", id(v)))
+        elif isinstance(e, Field):
+            o = self.try_value(e.obj, fr)
+            out |= self.storage_of(e.obj, fr) if not isinstance(o, Rec) else {("f", id(o), e.name)}
+        elif isinstance(e, Index):
+            a = self.try_value(e.obj, fr)
+            i = self.try_value(e.indices[0], fr) if not any(isinstance(n, Call) for n in walk(e.indices[0])) else None
+            out |= {("i", id(a), i)} if isinstance(a, Arr) and isinstance(i, int) else \
+                   ({("o", id(a))} if isinstance(a, Arr) else set())
+            out |= self.storage_of(e.indices[0], fr)
+        elif isinstance(e, (Unary,)):
+            out |= self.storage_of(e.operand, fr)
+        elif isinstance(e, Binary):
+            out |= self.storage_of(e.left, fr) | self.storage_of(e.right, fr)
+        elif isinstance(e, Call):
+            for a in e.args:
+                out |= self.storage_of(a, fr)
+        return out
+
+    def try_value(self, e, fr):
+        if any(isinstance(n, Call) for n in walk(e)):
+            return None
+        try:
+            return self.ev(e, fr, True)
+        except Stuck:
+            return None
+
+    @staticmethod
+    def overlap(a, b):
+        if a[0] == "o" or b[0] == "o":
+            return a[0] != "c" and b[0] != "c" and a[1] == b[1]
+        if a[0] != b[0]:
+            return False
+        return a[1:] == b[1:] if a[0] != "i" else (a[1] == b[1] and (a[2] == b[2] or a[2] is None or b[2] is None))
+
     # ---------------------------------------------------------------- lvalues and calls
     def lvalue(self, e, fr):
         if isinstance(e, Name):
@@ -396,11 +496,29 @@ class Machine:
             raise Stuck("type", f"unknown function {n}", e.loc)
         targs = e.targs or []
         genv = self.bind(fn.gparams, targs, fr.genv, e.loc) if fn.gparams else {}
+        if self.own:        # inside the callee a generic type parameter is opaque, hence non-Copy
+            genv = {k: (kind, self.opaque(v) if kind == "type" else v) for k, (kind, v) in genv.items()}
+        if self.own:
+            muts = [(i, a) for i, (p, a) in enumerate(zip(fn.params, e.args)) if p.mode == "mutable"]
+            for i, a in muts:
+                rn = self.root_name(a)
+                if rn is None or rn not in fr.env or not fr.env[rn].mutable:
+                    raise Stuck("ownership", f"argument for mutable parameter must be a mutable variable", a.loc)
+                mine = self.storage_of(a, fr) if isinstance(a, Name) else self.storage_of(a, fr)
+                for j, other in enumerate(e.args):
+                    if j == i:
+                        continue
+                    theirs = self.storage_of(other, fr)
+                    if any(self.overlap(x, y) for x in mine for y in theirs):
+                        raise Stuck("ownership", f"aliasing: mutable argument {fmt_expr(a)} overlaps argument "
+                                    f"{fmt_expr(other)}", a.loc)
         args = []
         for p, a in zip(fn.params, e.args):
             pd = self.resolve(p.ty, genv)
             if p.mode == "mutable" and pd.kind not in ("record", "array"):
                 args.append(("slot", self.lvalue(a, fr), pd))
+            elif p.mode == "consume":
+                args.append(("val", self.ev_owned(a, fr), pd))
             else:
                 args.append(("val", self.ev(a, fr), pd))
         return self.call_fn(fn, targs, args, fr, genv=genv, loc=e.loc)
@@ -425,7 +543,7 @@ class Machine:
                     old.env[p.name] = Cell(copy.deepcopy(val.get()), pd)
                 else:
                     self.check(pd, val, f"argument '{p.name}'", loc)
-                    fr.env[p.name] = Cell(val, pd)
+                    fr.env[p.name] = Cell(val, pd, mutable=p.mode != "in", borrowed=p.mode != "consume")
                     old.env[p.name] = Cell(copy.deepcopy(val), pd)
             for req in fn.requires:
                 if self.ev(req, fr, True) is not True:
@@ -489,7 +607,7 @@ class Machine:
     def init_value(self, desc, e, fr):
         """Initialise a typed declaration: fill(x), a record constructor, or an ordinary expression."""
         if desc.kind == "array" and isinstance(e, Call) and e.name == "fill":
-            x = self.ev(e.args[0], fr)
+            x = self.ev_owned(e.args[0], fr)
             return Arr(desc, [copy.deepcopy(x) for _ in range(desc.length)])
         if desc.kind == "record" and isinstance(e, Call) and e.name == desc.decl.name:
             fields, fdescs = {}, {}
@@ -497,7 +615,7 @@ class Machine:
                 fdescs[fd.name] = self.resolve(fd.ty, desc.renv)
                 fields[fd.name] = self.init_value(fdescs[fd.name], a, fr)
             return Rec(desc, fields, fdescs)
-        return self.ev(e, fr)
+        return self.ev_owned(e, fr)
 
     def exec(self, s, fr, added):
         self.tick()
@@ -507,24 +625,31 @@ class Machine:
                 v = self.init_value(d, s.value, fr)
                 self.check(d, v, f"declaration of '{s.name}'", s.loc)
             else:
-                v = self.ev(s.value, fr)
-                d = self.desc_of_value(v)
-            fr.env[s.name] = Cell(v, d)
+                v = self.ev_owned(s.value, fr)
+                slot = self.try_slot(s.value, fr) if isinstance(s.value, (Name, Field, Index)) else None
+                d = slot.desc if slot is not None and slot.desc is not None else self.desc_of_value(v)
+            fr.env[s.name] = Cell(v, d, mutable=bool(getattr(s, "mutable", True)))
             added.append(s.name)
         elif isinstance(s, Assign):
-            slot = self.lvalue(s.target, fr)
-            v = self.ev(s.value, fr)
+            rn = self.root_name(s.target)
+            if self.own and rn is not None and rn in fr.env and not fr.env[rn].mutable:
+                raise Stuck("ownership", f"assignment to immutable variable '{rn}'", s.loc)
+            v = self.ev_owned(s.value, fr)
+            slot = self.lvalue(s.target, fr) if not (isinstance(s.target, Name) and rn in fr.env
+                                                      and fr.env[rn].moved) else fr.env[rn]
             self.check(slot.desc, v, f"assignment to {fmt_expr(s.target)}", s.loc, record_invariants=False)
             if isinstance(slot, RefSlot):
                 self.check(slot.inner.desc, v, f"assignment to {fmt_expr(s.target)}", s.loc, record_invariants=False)
             slot.put(v)
+            if isinstance(s.target, Name) and s.target.ident in fr.env:
+                fr.env[s.target.ident].moved = False       # re-initialisation of a moved variable
         elif isinstance(s, Assert):
             if self.ev(s.expr, fr, True) is not True:
                 raise Stuck("assert", f"`{fmt_expr(s.expr)}` is false", s.loc)
         elif isinstance(s, ExprStmt):
             self.ev(s.expr, fr)
         elif isinstance(s, Return):
-            raise _Return(None if s.value is None else self.ev(s.value, fr))
+            raise _Return(None if s.value is None else self.ev_owned(s.value, fr))
         elif isinstance(s, If):
             for cond, body in s.branches:
                 if self.ev(cond, fr) is True:
